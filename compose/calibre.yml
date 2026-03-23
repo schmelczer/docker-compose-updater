@@ -1,0 +1,11 @@
+name: active
+services:
+  audiobookshelf:
+    image: advplyr/audiobookshelf:2.26.0
+
+  calibre-web:
+    image: "" # required for wud
+    build:
+
+networks:
+  local-network:

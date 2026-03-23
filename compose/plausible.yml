@@ -1,0 +1,16 @@
+# copied from https://github.com/plausible/hosting/tree/master
+name: active
+services:
+  plausible:
+    image: plausible/analytics:v2.0.0
+
+  plausible_db:
+    image: postgres:14-alpine
+
+  plausible_events_db:
+    image: clickhouse/clickhouse-server:23.3.7.5-alpine
+
+networks:
+  local-network:
+  plausible-network:
+    internal: true

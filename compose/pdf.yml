@@ -1,0 +1,7 @@
+name: active
+services:
+  stirling-pdf:
+    image: stirlingtools/stirling-pdf:1.0.2-fat
+
+networks:
+  local-network:

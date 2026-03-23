@@ -1,0 +1,44 @@
+version: '3.8'
+
+services:
+  docker-compose-updater:
+    image: ghcr.io/your-username/docker-compose-updater:latest
+    container_name: docker-compose-updater
+    restart: unless-stopped
+    
+    environment:
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - GITLAB_TOKEN=${GITLAB_TOKEN}
+      - RUST_LOG=info
+      - TZ=UTC
+    
+    volumes:
+      # Mount Docker socket for container management
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      
+      # Mount directory containing your compose files
+      - ./compose-files:/app/compose-files:rw
+      
+      # Mount configuration
+      - ./config.yaml:/app/config/config.yaml:ro
+      
+      # Optional: Mount additional compose files
+      - ./docker-compose.yml:/app/docker-compose.yml:rw
+      
+    ports:
+      - "8080:8080"
+    
+    networks:
+      - updater-network
+    
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    
+
+networks:
+  updater-network:
+    driver: bridge

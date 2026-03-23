@@ -1,0 +1,4 @@
+name: active
+services:
+  vaultwarden:
+    image: vaultwarden/server:1.34.1

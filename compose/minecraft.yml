@@ -1,0 +1,4 @@
+name: active
+services:
+  minecraft_andris:
+    image: itzg/minecraft-server:2025.6.2-java21-graalvm

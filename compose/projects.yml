@@ -1,0 +1,54 @@
+name: active
+services:
+  declared:
+    build:
+      context: /volumes/declared-server
+    container_name: declared
+    environment:
+      NODE_ENV: production
+      TZ: $TIME_ZONE
+    networks:
+      - local-network
+    restart: unless-stopped
+    user: "1000"
+    init: true
+    tty: true
+
+  life-towers:
+    build:
+      context: /volumes/life-towers
+    container_name: life_towers
+    depends_on:
+      - towers-db
+    environment:
+      TZ: $TIME_ZONE
+    networks:
+      - towers-network
+      - local-network
+    restart: unless-stopped
+    user: "1000"
+    init: true
+    tty: true
+
+  towers-db:
+    image: postgres:15.3-alpine3.18
+    container_name: towers_db
+    volumes:
+      - /volumes/life-towers/db:/var/lib/postgresql/data
+      - /volumes/life-towers/src/schema.sql:/docker-entrypoint-initdb.d/init.sql
+    environment:
+      POSTGRES_USER: storebackend
+      POSTGRES_PASSWORD: UKLpn6y4j4AjmBuB
+      POSTGRES_DB: store
+      TZ: $TIME_ZONE
+    networks:
+      - towers-network
+    restart: unless-stopped
+    user: "1000"
+    init: true
+    tty: true
+
+networks:
+  local-network:
+  towers-network:
+    internal: true

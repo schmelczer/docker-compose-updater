@@ -1,0 +1,19 @@
+name: active
+services:
+  paperless-ai:
+    image: clusterzx/paperless-ai:3.0.7
+
+  paperless-broker:
+    image: redis:8.0.3-alpine
+
+  paperless-gotenberg:
+    image: gotenberg/gotenberg:8.21.1
+
+  paperless-ollama:
+    image: ollama/ollama:0.9.6
+
+  paperless-tika:
+    image: apache/tika:3.2.1.0-full
+
+  paperless-webserver:
+    image: ghcr.io/paperless-ngx/paperless-ngx:2.17.1

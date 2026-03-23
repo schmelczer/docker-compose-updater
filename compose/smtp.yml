@@ -1,0 +1,4 @@
+name: active
+services:
+  smtp:
+    image: bytemark/smtp:latest

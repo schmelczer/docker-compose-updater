@@ -1,0 +1,10 @@
+name: active
+services:
+  filebrowser:
+    image: filebrowser/filebrowser:v2.40.1
+
+  syncthing:
+    image: syncthing/syncthing:1.30.0
+
+networks:
+  local-network:

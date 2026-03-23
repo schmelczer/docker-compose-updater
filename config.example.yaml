@@ -1,0 +1,46 @@
+# Docker Compose Updater Configuration
+# This configuration determines how the updater behaves
+
+# Paths to scan for Docker Compose files
+compose_paths:
+  - "/app/compose-files"
+  - "./docker-compose.yml"
+  - "./compose.yml"
+
+# Cron expression for when to run updates
+# Default: Daily at 2 AM UTC
+schedule: "0 0 2 * * *"
+
+# Registry configurations
+# All registries use the standard Docker Registry v2 API
+registries:
+  "docker.io":
+    url: "https://registry-1.docker.io"
+    # Docker Hub uses the standard registry API endpoint
+
+  "ghcr.io":
+    url: "https://ghcr.io"
+    auth_token: "${GITHUB_TOKEN}"
+    # GitHub token must have 'read:packages' scope and access to the target repositories
+
+  "registry.gitlab.com":
+    url: "https://registry.gitlab.com"
+    auth_token: "${GITLAB_TOKEN}"
+
+  # Add any custom registry following the same pattern:
+  # "my-registry.company.com":
+  #   url: "https://my-registry.company.com"
+  #   auth_token: "${CUSTOM_REGISTRY_TOKEN}"
+
+# Update strategy
+# Options: LatestPatchOfPreviousMinor (default), LatestPatchOfPreviousMinor, Latest
+update_strategy: "LatestPatchOfPreviousMinor"
+
+# Images to ignore (substring matching)
+ignore_images:
+  - "localhost"
+  - "127.0.0.1"
+  - "local/"
+
+# Dry run mode - if true, no files will be modified
+dry_run: false

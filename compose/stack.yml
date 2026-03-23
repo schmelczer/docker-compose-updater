@@ -1,0 +1,18 @@
+# The necesseary services for keeping the stack running.
+
+# The goal is to keep the number of this to a minimum as to decrease overhead
+# and avoid unneeded complexity.
+
+name: active
+services:
+  dozzle:
+    image: amir20/dozzle:v8.13.6
+
+  uptime-kuma:
+    image: louislam/uptime-kuma:1.23.16
+
+  homepage:
+    image: ghcr.io/gethomepage/homepage:feature-deps-180425
+
+networks:
+  local-network:

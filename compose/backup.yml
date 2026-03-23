@@ -1,0 +1,4 @@
+name: active
+services:
+  backup:
+    image: ghcr.io/schmelczer/backup-container:v0.0.3

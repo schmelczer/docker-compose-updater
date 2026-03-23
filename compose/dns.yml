@@ -1,0 +1,4 @@
+name: active
+services:
+  dns-server:
+    image: technitium/dns-server:13.6.0

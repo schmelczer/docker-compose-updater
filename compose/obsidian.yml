@@ -1,0 +1,4 @@
+name: active
+services:
+  obsidian:
+    image: ghcr.io/schmelczer/vault-link:0.5.1

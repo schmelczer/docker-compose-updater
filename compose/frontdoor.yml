@@ -1,0 +1,39 @@
+name: active
+services:
+  authelia:
+    image: authelia/authelia:4.39.5
+
+  certbot:
+    image: certbot/dns-digitalocean:v4.1.1
+
+  dyndns:
+    build:
+      context: /volumes/dyndns
+    container_name: frontdoor_dyndns
+    environment:
+      TZ: $TIME_ZONE
+      DOMAIN: schmelczer.dev
+      NAME: home;cloud;dns;immich;declared;pdf;homeassistant;store;audiobook;books;movies;stats;wud;auth;paperless;minecraft;torrent;obsidian;ghostfolio;vpn;mealie
+      DIGITALOCEAN_TOKEN: $DIGITALOCEAN_TOKEN
+    networks:
+      - local-network
+    restart: unless-stopped
+    init: true
+    tty: true
+
+  fail2ban:
+    image: ghcr.io/crazy-max/fail2ban:1.1.0
+    container_name: frontdoor_fail2ban
+    volumes:
+      - /volumes/fail2ban:/data
+      - /volumes/nginx/logs:/var/log:ro
+      - /volumes/vaultwarden/data/vaultwarden.log:/vaultwarden/vaultwarden.log:ro
+    environment:
+      TZ: $TIME_ZONE
+      F2B_LOG_TARGET: STDOUT
+
+  tinyauth:
+    image: ghcr.io/steveiliop56/tinyauth:v3.6.2
+
+  nginx:
+    image: nginx:1.29.0

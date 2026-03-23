@@ -1,0 +1,33 @@
+name: active
+services:
+  ssh:
+    build:
+      context: /volumes/stack
+    container_name: ssh
+    volumes:
+      - /volumes:/volumes
+      - /:/host
+      - /volumes/stack:/root/stack
+      - /volumes/stack/.zsh_history:/root/.zsh_history
+      - /volumes/stack/.zshrc:/root/.zshrc
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      TZ: $TIME_ZONE
+    network_mode: host
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    cap_add:
+      - SYS_ADMIN
+      - SYS_RAWIO
+    deploy:
+      resources:
+        limits:
+          cpus: "12"
+          memory: 4G
+    devices:
+      - "/dev/nvme0n1"
+    tty: true
+
+networks:
+  local-network:

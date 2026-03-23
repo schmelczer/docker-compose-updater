@@ -1,0 +1,20 @@
+name: active
+services:
+  github-runner:
+    build:
+      context: /volumes/github-runner
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - REPO_URL=https://github.com/schmelczer/vault-link
+      - ACCESS_TOKEN=$GITHUB_ACTIONS_RUNNER_TOKEN
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '6'
+          memory: '8G'
+      mode: replicated
+      replicas: 3
+    init: true
+    tty: true

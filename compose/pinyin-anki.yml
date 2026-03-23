@@ -1,0 +1,7 @@
+name: active
+services:
+  pinyin-anki:
+    image: ghcr.io/schmelczer/pinyin:latest
+
+networks:
+  local-network:

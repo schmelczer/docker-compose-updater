@@ -1,0 +1,41 @@
+# Rust
+target/
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Test files
+test/
+tests/
+
+# Documentation
+README.md
+docs/
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+
+# Runtime files
+backups/
+compose-files/
+config.yaml
+
+# Docker
+docker-compose.yml
+Dockerfile
+.dockerignore

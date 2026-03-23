@@ -1,0 +1,22 @@
+compose_paths:
+  - "/app/compose-files"
+  - "./test-docker-compose.yml"
+
+schedule: "0 0 2 * * *"
+
+registries:
+  "docker.io":
+    url: "https://registry-1.docker.io"
+
+  "ghcr.io":
+    url: "https://ghcr.io"
+    auth_token: "${GITHUB_TOKEN}"
+
+update_strategy: "LatestPatchOfPreviousMinor"
+
+ignore_images:
+  - "localhost"
+  - "127.0.0.1"
+  - "local/"
+
+dry_run: true
