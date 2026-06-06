@@ -8,6 +8,8 @@ on:
     branches: [main]
 
 env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: '-Dwarnings'
   REGISTRY: ${{ forgejo.server_url }}
   IMAGE_NAME: ${{ forgejo.repository }}
 
@@ -15,20 +17,26 @@ jobs:
   test:
     runs-on: docker
     steps:
-      - name: Checkout repository
-        uses: https://code.forgejo.org/actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Install components
-        run: rustup component add rustfmt clippy
-
-      - name: Cache cargo registry
-        uses: https://code.forgejo.org/actions/cache@v4
+      - name: Cache Rust dependencies
+        uses: actions/cache@v4
         with:
           path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain stable --profile default
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Run tests
         run: cargo test --verbose
@@ -43,8 +51,7 @@ jobs:
     needs: test
     runs-on: docker
     steps:
-      - name: Checkout repository
-        uses: https://code.forgejo.org/actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Build and publish image
         uses: http://forgejo:3000/andras/ci-actions/docker-publish@main
