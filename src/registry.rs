@@ -4,13 +4,18 @@ use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
 use reqwest::{Client as HttpClient, Response, StatusCode};
 use serde::Deserialize;
+use std::sync::LazyLock;
 use std::time::Duration;
 use tokio::time::sleep;
 use tracing::{debug, warn};
 
 const PAGE_SIZE: usize = 500;
+const MAX_PAGES: usize = 100;
 const MAX_RETRY_ATTEMPTS: u32 = 5;
+const MAX_AUTH_ATTEMPTS: u32 = 2;
 const INITIAL_RETRY_DELAY_SECS: u64 = 1;
+const HTTP_TIMEOUT_SECS: u64 = 30;
+const HTTP_CONNECT_TIMEOUT_SECS: u64 = 10;
 
 #[derive(Debug, Clone)]
 pub struct ImageRef {
@@ -49,7 +54,6 @@ impl ImageRef {
                 }
             }
             _ => {
-                // 3 or more parts: first is registry, last is name, everything in between is namespace
                 let registry = registry_parts[0].to_string();
                 let name = registry_parts[registry_parts.len() - 1].to_string();
                 let namespace = Some(registry_parts[1..registry_parts.len() - 1].join("/"));
@@ -68,23 +72,20 @@ impl ImageRef {
 
 impl std::fmt::Display for ImageRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let base = match &self.namespace {
-            Some(ns) => format!("{}/{}/{}", self.registry, ns, self.name),
-            None => format!("{}/{}", self.registry, self.name),
-        };
-
         if self.registry == "docker.io" {
             match &self.namespace {
                 Some(ns) => write!(f, "{}/{}:{}", ns, self.name, self.tag),
                 None => write!(f, "{}:{}", self.name, self.tag),
             }
         } else {
-            write!(f, "{}:{}", base, self.tag)
+            match &self.namespace {
+                Some(ns) => write!(f, "{}/{}/{}:{}", self.registry, ns, self.name, self.tag),
+                None => write!(f, "{}/{}:{}", self.registry, self.name, self.tag),
+            }
         }
     }
 }
 
-/// Docker Hub API response for tag list
 #[derive(Deserialize)]
 struct DockerHubTagsResponse {
     results: Vec<DockerHubTag>,
@@ -96,8 +97,6 @@ struct DockerHubTag {
     name: String,
 }
 
-/// Unified registry client with hybrid approach
-/// Uses Docker Hub's public API for Docker Hub, standard v2 API for others
 pub struct Client {
     http_client: HttpClient,
     config: Config,
@@ -105,21 +104,23 @@ pub struct Client {
 
 impl Client {
     pub fn new(config: Config) -> Self {
+        let http_client = HttpClient::builder()
+            .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
+            .connect_timeout(Duration::from_secs(HTTP_CONNECT_TIMEOUT_SECS))
+            .build()
+            .expect("failed to build HTTP client");
+
         Self {
-            http_client: HttpClient::new(),
+            http_client,
             config,
         }
     }
 
-    /// Parse Retry-After header to determine wait duration
-    /// Supports both delay-seconds (integer) and HTTP-date formats
     fn parse_retry_after(&self, retry_after: &str) -> Option<Duration> {
-        // Try parsing as seconds first
         if let Ok(seconds) = retry_after.parse::<u64>() {
             return Some(Duration::from_secs(seconds));
         }
 
-        // Try parsing as HTTP date (RFC 2822 or RFC 3339)
         if let Ok(date) = DateTime::parse_from_rfc2822(retry_after) {
             let now = Utc::now();
             let wait_time = date.signed_duration_since(now);
@@ -131,7 +132,6 @@ impl Client {
         None
     }
 
-    /// Perform HTTP request with retry logic for rate limiting (429)
     async fn request_with_retry<F, Fut>(
         &self,
         request_fn: F,
@@ -158,7 +158,6 @@ impl Client {
                     ));
                 }
 
-                // Check for Retry-After header
                 let wait_duration = if let Some(retry_after) = response
                     .headers()
                     .get("retry-after")
@@ -176,7 +175,6 @@ impl Client {
 
                 sleep(wait_duration).await;
 
-                // Exponential backoff for next attempt if no Retry-After header
                 delay = delay.saturating_mul(2);
             } else {
                 return Ok(response);
@@ -194,15 +192,10 @@ impl Client {
     fn build_repository_path(&self, image_ref: &ImageRef) -> String {
         match &image_ref.namespace {
             Some(namespace) => format!("{}/{}", namespace, image_ref.name),
-            None => {
-                if image_ref.registry == "docker.io" {
-                    // For Docker Hub official images, use 'library' namespace in public API
-                    format!("library/{}", image_ref.name)
-                } else {
-                    // For other registries, no namespace means just the image name
-                    image_ref.name.clone()
-                }
+            None if image_ref.registry == "docker.io" => {
+                format!("library/{}", image_ref.name)
             }
+            None => image_ref.name.clone(),
         }
     }
 
@@ -255,7 +248,7 @@ impl Client {
     async fn get_dockerhub_versions(&self, image_ref: &ImageRef) -> Result<Vec<VersionInfo>> {
         let repo_path = self.build_repository_path(image_ref);
         let mut results = Vec::new();
-        // Use Docker Hub's public REST API which doesn't require authentication for public repos
+        let mut page_count: usize = 0;
         let mut url = format!(
             "https://hub.docker.com/v2/repositories/{repo_path}/tags/?page_size={PAGE_SIZE}"
         );
@@ -286,6 +279,15 @@ impl Client {
 
             results.extend(new_tags);
 
+            page_count += 1;
+            if page_count >= MAX_PAGES {
+                warn!(
+                    "Reached maximum page count ({}) for {}, stopping pagination",
+                    MAX_PAGES, image_ref
+                );
+                break;
+            }
+
             if let Some(next) = next_page {
                 url = next;
             } else {
@@ -304,12 +306,16 @@ impl Client {
         let mut last_tag: Option<String> = None;
         let mut next_url: Option<String> = None;
         let mut bearer_token: Option<String> = None;
+        let mut auth_attempts: u32 = 0;
+        let mut page_count: usize = 0;
 
-        // Reference: https://github.com/opencontainers/distribution-spec/blob/main/spec.md#endpoints
         loop {
-            // Use next URL from Link header if available, otherwise build URL with last parameter
             let url = if let Some(next) = next_url.take() {
-                format!("{}{next}", registry_config.url)
+                if next.starts_with("http://") || next.starts_with("https://") {
+                    next
+                } else {
+                    format!("{}{next}", registry_config.url)
+                }
             } else {
                 format!(
                     "{}/v2/{repo_path}/tags/list?n={PAGE_SIZE}{}",
@@ -324,7 +330,6 @@ impl Client {
 
             debug!("Registry API URL: {}", url);
 
-            // Try unauthenticated request first to potentially get auth challenge
             let url_clone = url.clone();
             let bearer_token_clone = bearer_token.clone();
             let response = self
@@ -341,13 +346,21 @@ impl Client {
                 .await?;
 
             let (new_tags, link_next) = if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+                if auth_attempts >= MAX_AUTH_ATTEMPTS {
+                    return Err(anyhow!(
+                        "Authentication failed after {} attempts for registry {}",
+                        auth_attempts,
+                        image_ref.registry
+                    ));
+                }
                 if let Some(token) = &registry_config.auth_token {
-                    // Try Docker Registry v2 auth flow if we get auth challenge
                     if let Some(auth_header) = response.headers().get("www-authenticate") {
-                        bearer_token = self
-                            .try_registry_v2_auth(auth_header.to_str().unwrap(), token)
-                            .await?;
-                        continue; // Retry with new token
+                        let auth_str = auth_header.to_str().map_err(|e| {
+                            anyhow!("Invalid WWW-Authenticate header encoding: {}", e)
+                        })?;
+                        bearer_token = self.try_registry_v2_auth(auth_str, token).await?;
+                        auth_attempts += 1;
+                        continue;
                     } else {
                         return Err(anyhow!(
                             "Unauthorized request but no WWW-Authenticate header found"
@@ -357,7 +370,6 @@ impl Client {
                     return Err(anyhow!("Unauthorized request but no auth token configured"));
                 }
             } else if response.status().is_success() {
-                // Check for Link header for pagination
                 let link_next = response
                     .headers()
                     .get("link")
@@ -377,14 +389,26 @@ impl Client {
                 ));
             };
 
+            page_count += 1;
+            if page_count >= MAX_PAGES {
+                warn!(
+                    "Reached maximum page count ({}) for {}, stopping pagination",
+                    MAX_PAGES, image_ref
+                );
+                results.extend(new_tags);
+                break;
+            }
+
             let maybe_last_tag = new_tags.last().map(|v| v.original.clone());
             results.extend(new_tags);
 
-            // Use Link header next URL if available, otherwise fall back to last parameter pagination
             if let Some(next) = link_next {
                 next_url = Some(next);
-            } else if let Some(last) = maybe_last_tag {
-                last_tag = Some(last);
+            } else if let Some(ref last) = maybe_last_tag {
+                if last_tag.as_ref() == Some(last) {
+                    break;
+                }
+                last_tag = maybe_last_tag;
             } else {
                 break;
             }
@@ -394,13 +418,15 @@ impl Client {
     }
 
     async fn try_registry_v2_auth(&self, auth_str: &str, token: &str) -> Result<Option<String>> {
-        // Parse WWW-Authenticate header to extract auth parameters
-        let realm = self.extract_auth_param(auth_str, "realm")?;
-        let service = self.extract_auth_param(auth_str, "service")?;
-        let scope = self.extract_auth_param(auth_str, "scope")?;
+        let realm = extract_auth_param(auth_str, "realm")?;
+        let service = extract_auth_param(auth_str, "service")?;
+        let scope = extract_auth_param(auth_str, "scope")?;
 
-        // Request token from auth endpoint
-        let auth_url = format!("{realm}?service={service}&scope={scope}");
+        let auth_url = format!(
+            "{realm}?service={}&scope={}",
+            urlencoding::encode(&service),
+            urlencoding::encode(&scope),
+        );
         debug!("Getting registry token from: {}", auth_url);
 
         let auth_url_clone = auth_url.clone();
@@ -432,29 +458,16 @@ impl Client {
             return Ok(Some(registry_token.to_string()));
         }
 
-        Err(anyhow!("Auth flow didn't work, caller can try fallback"))
-    }
-
-    fn extract_auth_param(&self, auth_str: &str, param: &str) -> Result<String> {
-        let pattern = format!(r#"{param}="([^"]+)""#);
-        let re = regex::Regex::new(&pattern)?;
-
-        re.captures(auth_str)
-            .and_then(|caps| caps.get(1))
-            .map(|m| m.as_str().to_string())
-            .ok_or_else(|| anyhow!("Missing {} in auth challenge", param))
+        Err(anyhow!("Auth response missing 'token' field"))
     }
 
     fn parse_link_header(&self, link_header: &str) -> Option<String> {
-        // Parse RFC 5988 Link header to find "next" relation
-        // Format: <https://example.com/page2>; rel="next", <https://example.com/last>; rel="last"
         for link in link_header.split(',') {
             let parts: Vec<&str> = link.trim().split(';').collect();
             if parts.len() >= 2 {
                 let url = parts[0].trim();
                 if url.starts_with('<') && url.ends_with('>') {
-                    let url = &url[1..url.len() - 1]; // Remove < and >
-
+                    let url = &url[1..url.len() - 1];
                     for param in &parts[1..] {
                         let param = param.trim();
                         if param == "rel=\"next\"" || param == "rel=next" {
@@ -466,6 +479,22 @@ impl Client {
         }
         None
     }
+}
+
+static AUTH_PARAM_REGEX: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r#"(\w+)="([^"]+)""#).unwrap());
+
+fn extract_auth_param(auth_str: &str, param: &str) -> Result<String> {
+    for caps in AUTH_PARAM_REGEX.captures_iter(auth_str) {
+        if caps.get(1).map(|m| m.as_str()) == Some(param) {
+            return Ok(caps[2].to_string());
+        }
+    }
+    Err(anyhow!(
+        "Missing '{}' in auth challenge: {}",
+        param,
+        auth_str
+    ))
 }
 
 #[cfg(test)]

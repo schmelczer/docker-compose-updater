@@ -1,22 +1,22 @@
 use anyhow::Result;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use tracing::info;
+use std::sync::LazyLock;
+use tracing::{info, warn};
+
+static ENV_VAR_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\$\{([^}]+)\}|\$([A-Za-z_][A-Za-z0-9_]*)").unwrap());
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Config {
-    #[serde(default)]
     pub compose_paths: Vec<PathBuf>,
-    #[serde(default)]
     pub schedule: String,
-    #[serde(default)]
     pub registries: HashMap<String, RegistryConfig>,
-    #[serde(default)]
     pub update_strategy: UpdateStrategy,
-    #[serde(default)]
     pub ignore_images: Vec<String>,
-    #[serde(default)]
     pub dry_run: bool,
 }
 
@@ -53,7 +53,7 @@ impl Default for Config {
 
         Self {
             compose_paths: vec![PathBuf::from(".")],
-            schedule: "0 0 2 * * *".to_string(), // Daily at 2 AM
+            schedule: "0 0 2 * * *".to_string(),
             registries,
             update_strategy: UpdateStrategy::LatestPatchOfPreviousMinor,
             ignore_images: vec![],
@@ -68,31 +68,32 @@ impl Config {
         let content = std::fs::read_to_string(config_path)?;
         let expanded_content = Self::expand_env_vars(&content);
         let mut config: Self = serde_yaml::from_str(&expanded_content)?;
-        config.resolve_env_tokens();
+        config.normalize_auth_tokens();
         Ok(config)
     }
 
-    /// Expand environment variable placeholders like ${VAR} in the config content
     pub fn expand_env_vars(content: &str) -> String {
-        let env_var_pattern = regex::Regex::new(r"\$\{([^}]+)\}").unwrap();
-
-        env_var_pattern
+        ENV_VAR_REGEX
             .replace_all(content, |caps: &regex::Captures| {
-                let var_name = &caps[1];
-                std::env::var(var_name).unwrap_or_else(|_| format!("${{{var_name}}}"))
+                let var_name = caps.get(1).or_else(|| caps.get(2)).unwrap().as_str();
+                std::env::var(var_name).unwrap_or_else(|_| {
+                    warn!(
+                        "Environment variable `{}` referenced in config is not set; substituting an empty string",
+                        var_name
+                    );
+                    String::new()
+                })
             })
-            .to_string()
+            .into_owned()
     }
 
-    /// Resolve environment variable tokens after deserialization
-    fn resolve_env_tokens(&mut self) {
-        for registry_config in self.registries.values_mut() {
-            if let Some(token) = &registry_config.auth_token {
-                if token.starts_with("$") {
-                    // Handle direct env var references like "$GITHUB_TOKEN"
-                    let env_var_name = token.trim_start_matches('$');
-                    registry_config.auth_token = std::env::var(env_var_name).ok();
-                }
+    /// Treat a registry `auth_token` that expanded to an empty string (e.g. an
+    /// unset `${TOKEN}`) as no token at all, so we fall back to unauthenticated
+    /// access with a clear error instead of attempting auth with an empty token.
+    fn normalize_auth_tokens(&mut self) {
+        for registry in self.registries.values_mut() {
+            if registry.auth_token.as_deref() == Some("") {
+                registry.auth_token = None;
             }
         }
     }
@@ -100,6 +101,6 @@ impl Config {
     pub fn is_image_ignored(&self, image: &str) -> bool {
         self.ignore_images
             .iter()
-            .any(|ignored| image.contains(ignored))
+            .any(|pattern| image.contains(pattern))
     }
 }

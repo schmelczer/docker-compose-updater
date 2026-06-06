@@ -1,6 +1,6 @@
 use crate::config::UpdateStrategy;
 use crate::version::VersionInfo;
-use tracing::{info, warn};
+use tracing::{debug, warn};
 
 pub fn create_selector(strategy: &UpdateStrategy) -> Box<dyn VersionSelector> {
     match strategy {
@@ -27,17 +27,15 @@ impl VersionSelector for LatestVersionSelector {
         current_prefix: Option<String>,
         current_suffix: Option<String>,
     ) -> Option<VersionInfo> {
-        info!("Using update strategy: LatestVersionSelector");
-
         let versions =
-            get_filtered_and_soreted_matching_versions(available, current_prefix, current_suffix);
+            get_filtered_and_sorted_matching_versions(available, current_prefix, current_suffix);
 
         let latest = versions.first().cloned();
 
         if let Some(ref selected) = latest {
-            info!("Selected {} as latest version", selected.version);
+            debug!("Latest version selected: {}", selected.version);
         } else {
-            warn!("No versions available for selection");
+            warn!("No matching versions available");
         }
 
         latest
@@ -53,25 +51,19 @@ impl VersionSelector for SmartPreviousMinorSelector {
         current_prefix: Option<String>,
         current_suffix: Option<String>,
     ) -> Option<VersionInfo> {
-        info!("Using update strategy: SmartPreviousMinorSelector");
-
         let versions =
-            get_filtered_and_soreted_matching_versions(available, current_prefix, current_suffix);
+            get_filtered_and_sorted_matching_versions(available, current_prefix, current_suffix);
 
         let latest = &versions.first()?.version;
-        info!("Latest version available: {}", latest);
+        debug!("Latest version available: {}", latest);
 
         let (target_major, max_minor) = if latest.minor == 0 {
-            // If current minor is 0, look for the latest minor of the previous major
             if latest.major == 0 {
-                info!("Cannot go to previous version of 0.0.x, skipping update");
+                debug!("Cannot go to previous version of 0.0.x");
                 return None;
             }
-
-            info!("The latest version has a minor version of 0, looking for the latest minor of the previous major");
             (latest.major - 1, None)
         } else {
-            info!("The latest version has a minor version of {}, looking for the latest patch of the previous minor", latest.minor);
             (latest.major, Some(latest.minor - 1))
         };
 
@@ -83,46 +75,35 @@ impl VersionSelector for SmartPreviousMinorSelector {
             .cloned();
 
         if let Some(ref selected) = selected {
-            info!("Selected {} as latest version", selected.version);
+            debug!("Selected version: {}", selected.version);
         } else {
-            warn!("No versions available for selection");
+            warn!("No matching versions available for previous minor strategy");
         }
 
         selected
     }
 }
 
-fn get_filtered_and_soreted_matching_versions(
+fn get_filtered_and_sorted_matching_versions(
     available: &[VersionInfo],
     current_prefix: Option<String>,
     current_suffix: Option<String>,
 ) -> Vec<VersionInfo> {
-    let mut sorted_versions = available.to_vec();
-    sorted_versions.sort_by(|a, b| b.version.cmp(&a.version));
-
-    info!(
-        "Available versions for selection: {}",
-        sorted_versions
-            .iter()
-            .map(|v| v.to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-    let filtered_versions: Vec<VersionInfo> = sorted_versions
-        .into_iter()
+    let mut versions: Vec<VersionInfo> = available
+        .iter()
         .filter(|v| v.prefix == current_prefix && v.suffix == current_suffix)
+        .cloned()
         .collect();
+    versions.sort_by(|a, b| b.version.cmp(&a.version));
 
-    info!(
-        "Filtered versions with matching prefix and suffix: {}",
-        filtered_versions
-            .iter()
-            .map(|v| v.to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
+    debug!(
+        "Filtered versions (prefix={:?}, suffix={:?}): {}",
+        current_prefix,
+        current_suffix,
+        versions.len()
     );
 
-    filtered_versions
+    versions
 }
 
 #[cfg(test)]

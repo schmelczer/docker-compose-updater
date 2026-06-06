@@ -1,6 +1,11 @@
 use regex::Regex;
 use semver::Version;
 use std::fmt;
+use std::sync::LazyLock;
+
+static VERSION_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^(?P<prefix>.*?)(?P<version>(?:\d+\.)+\d+)(?P<suffix>.*?)$").unwrap()
+});
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct VersionInfo {
@@ -24,9 +29,7 @@ impl VersionInfo {
     /// assert_eq!(version_info.suffix, Some("-alpine-slim".to_string()));
     /// ```
     pub fn from_tag(tag: &str) -> Option<Self> {
-        let re = Regex::new(r"^(?P<prefix>.*?)(?P<version>(?:\d+\.)+\d+)(?P<suffix>.*?)$").unwrap();
-
-        if let Some(captures) = re.captures(tag) {
+        if let Some(captures) = VERSION_REGEX.captures(tag) {
             let prefix_part = captures.name("prefix").map_or("", |m| m.as_str());
             let version_part = captures.name("version").map_or("", |m| m.as_str());
             let suffix_part = captures.name("suffix").map_or("", |m| m.as_str());

@@ -33,7 +33,7 @@ registries:
   #   auth_token: "${CUSTOM_REGISTRY_TOKEN}"
 
 # Update strategy
-# Options: LatestPatchOfPreviousMinor (default), LatestPatchOfPreviousMinor, Latest
+# Options: LatestPatchOfPreviousMinor (default), Latest
 update_strategy: "LatestPatchOfPreviousMinor"
 
 # Images to ignore (substring matching)

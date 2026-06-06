@@ -1,14 +1,20 @@
 use super::parser::{ComposeFile, ComposeParser, ServiceImage};
-use crate::config::Config;
-use crate::registry::Client as RegistryClient;
+use crate::config::{Config, UpdateStrategy};
+use crate::registry::{Client as RegistryClient, ImageRef};
 use crate::strategy::create_selector;
-use crate::version::parse_version_tag;
+use crate::version::{parse_version_tag, VersionInfo};
 use anyhow::{anyhow, Result};
 use regex::Regex;
+use semver::Version;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use tracing::{debug, info, warn};
+
+static IMAGE_LINE_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"^(\s*image:\s*)(?:["']([^"']+)["']|([^\s#]+))(\s*(?:#.*)?)$"#).unwrap()
+});
 
 pub struct ComposeUpdater {
     config: Config,
@@ -16,23 +22,28 @@ pub struct ComposeUpdater {
     parser: ComposeParser,
 }
 
+pub struct UpdateReport {
+    pub files_found: usize,
+    pub updated_files: Vec<String>,
+}
+
 impl ComposeUpdater {
     pub fn new(config: Config) -> Self {
         let registry_client = RegistryClient::new(config.clone());
-        let parser = ComposeParser::new();
-
         Self {
             config,
             registry_client,
-            parser,
+            parser: ComposeParser::new(),
         }
     }
 
-    pub async fn update_all_compose_files(&self) -> Result<Vec<String>> {
+    pub async fn update_all_compose_files(&self) -> Result<UpdateReport> {
         let mut updated_files = Vec::new();
+        let mut files_found = 0;
 
         for compose_path in &self.config.compose_paths {
             let compose_files = self.find_compose_files(compose_path)?;
+            files_found += compose_files.len();
 
             for file_path in compose_files {
                 let updated = self.update_compose_file(&file_path).await?;
@@ -42,7 +53,10 @@ impl ComposeUpdater {
             }
         }
 
-        Ok(updated_files)
+        Ok(UpdateReport {
+            files_found,
+            updated_files,
+        })
     }
 
     pub fn parse_compose_file(&self, file_path: &str) -> Result<ComposeFile> {
@@ -58,7 +72,7 @@ impl ComposeUpdater {
 
         for service in &compose_file.services {
             if self.config.is_image_ignored(&service.image_ref.to_string()) {
-                info!("Skipping ignored image: {}", service.image_ref.to_string());
+                debug!("Skipping ignored image: {}", service.image_ref);
                 continue;
             }
 
@@ -69,16 +83,13 @@ impl ComposeUpdater {
                     updated = true;
                     info!(
                         "Updated {}: {} -> {}",
-                        service.service_name,
-                        service.image_ref.to_string(),
-                        new_image
+                        service.service_name, service.image_ref, new_image
                     );
                 }
                 Ok(None) => {
                     debug!(
                         "No update needed for {}: {}",
-                        service.service_name,
-                        service.image_ref.to_string()
+                        service.service_name, service.image_ref
                     );
                 }
                 Err(e) => {
@@ -97,23 +108,26 @@ impl ComposeUpdater {
     }
 
     fn write_updated_content(&self, file_path: &str, content: String) -> Result<()> {
-        if !self.config.dry_run {
+        if self.config.dry_run {
+            info!("Dry run: would update {}", file_path);
+        } else {
             fs::write(file_path, content)?;
             info!("Updated compose file: {}", file_path);
-        } else {
-            info!("Dry run: Would update compose file: {}", file_path);
         }
         Ok(())
     }
 
     async fn update_service_image(&self, service: &ServiceImage) -> Result<Option<String>> {
-        info!(
-            "Checking for updates for service: {} (current image: {})",
-            service.service_name,
-            service.image_ref.to_string()
-        );
         let (current_version, current_prefix, current_suffix, _) =
             parse_version_tag(&service.image_ref.tag);
+
+        let Some(current_version) = current_version else {
+            debug!(
+                "Skipping non-semver tag '{}' for service {}",
+                service.image_ref.tag, service.service_name
+            );
+            return Ok(None);
+        };
 
         let available_versions = self
             .registry_client
@@ -121,33 +135,18 @@ impl ComposeUpdater {
             .await?;
 
         if available_versions.is_empty() {
-            warn!("No versions available for selection");
+            warn!("No versions available for {}", service.image_ref);
             return Ok(None);
         }
 
-        let selector = create_selector(&self.config.update_strategy);
-        if let Some(target_version_info) =
-            selector.select_target_version(&available_versions, current_prefix, current_suffix)
-        {
-            // Only update if the target version is different AND higher than the current version
-            // This prevents downgrades
-            if Some(target_version_info.version.clone()) != current_version {
-                if let Some(ref current_ver) = current_version {
-                    if target_version_info.version < *current_ver {
-                        info!(
-                            "Skipping downgrade from {} to {}",
-                            current_ver, target_version_info.version
-                        );
-                        return Ok(None);
-                    }
-                }
-                let mut new_image_ref = service.image_ref.clone();
-                new_image_ref.tag = target_version_info.to_string();
-                return Ok(Some(new_image_ref.to_string()));
-            }
-        }
-
-        Ok(None)
+        Ok(choose_new_tag(
+            &service.image_ref,
+            &current_version,
+            &available_versions,
+            current_prefix,
+            current_suffix,
+            &self.config.update_strategy,
+        ))
     }
 
     pub fn replace_image_in_content(
@@ -156,49 +155,44 @@ impl ComposeUpdater {
         service: &ServiceImage,
         new_image: &str,
     ) -> Result<String> {
-        let image_regex =
-            Regex::new(r#"^(\s*image:\s*)(?:["']([^"']+)["']|([^\s#]+))(\s*(?:#.*)?)$"#)?;
-
-        if let Some(captures) = image_regex.captures(&service.original_line) {
-            let prefix = captures.get(1).unwrap().as_str();
-            let _old_image = captures
-                .get(2)
-                .or_else(|| captures.get(3))
-                .unwrap()
-                .as_str();
-            let suffix = captures.get(4).unwrap().as_str();
-
-            let image_part = if captures.get(2).is_some() {
-                format!("\"{new_image}\"")
-            } else {
-                new_image.to_string()
-            };
-
-            let new_line = format!("{prefix}{image_part}{suffix}");
-
-            let lines: Vec<&str> = content.lines().collect();
-            if service.line_number < lines.len()
-                && lines[service.line_number] == service.original_line
-            {
-                let mut result_lines = lines;
-                result_lines[service.line_number] = &new_line;
-                let mut result = result_lines.join("\n");
-
-                if content.ends_with('\n') {
-                    result.push('\n');
-                }
-
-                Ok(result)
-            } else {
-                Err(anyhow!(
-                    "Line number mismatch or content changed for service: {}",
-                    service.service_name
-                ))
-            }
-        } else {
-            Err(anyhow!(
+        let Some(captures) = IMAGE_LINE_REGEX.captures(&service.original_line) else {
+            return Err(anyhow!(
                 "Could not parse image line: {}",
                 service.original_line
+            ));
+        };
+
+        let prefix = captures.get(1).unwrap().as_str();
+        let suffix = captures.get(4).unwrap().as_str();
+        let was_quoted = captures.get(2).is_some();
+
+        let image_part = if was_quoted {
+            format!("\"{new_image}\"")
+        } else {
+            new_image.to_string()
+        };
+
+        let new_line = format!("{prefix}{image_part}{suffix}");
+
+        let lines: Vec<&str> = content.lines().collect();
+        if service.line_number < lines.len() && lines[service.line_number] == service.original_line
+        {
+            let mut result_lines = lines;
+            result_lines[service.line_number] = &new_line;
+            let mut result = result_lines.join("\n");
+
+            if content.ends_with('\n') {
+                result.push('\n');
+            }
+
+            Ok(result)
+        } else {
+            Err(anyhow!(
+                "Line mismatch for service '{}': line {} expected '{}', got '{}'",
+                service.service_name,
+                service.line_number,
+                service.original_line,
+                lines.get(service.line_number).unwrap_or(&"<out of bounds>")
             ))
         }
     }
@@ -256,38 +250,111 @@ impl ComposeUpdater {
     }
 }
 
+/// Chooses the new image string for `image_ref`, or `None` when no suitable
+/// upgrade exists. The selected version must share the current tag's prefix and
+/// suffix and be strictly higher than `current_version`, which prevents both
+/// downgrades and no-op rewrites to the same version.
+fn choose_new_tag(
+    image_ref: &ImageRef,
+    current_version: &Version,
+    available_versions: &[VersionInfo],
+    current_prefix: Option<String>,
+    current_suffix: Option<String>,
+    strategy: &UpdateStrategy,
+) -> Option<String> {
+    let selector = create_selector(strategy);
+    let target =
+        selector.select_target_version(available_versions, current_prefix, current_suffix)?;
+
+    if target.version <= *current_version {
+        return None;
+    }
+
+    let mut new_image_ref = image_ref.clone();
+    new_image_ref.tag = target.to_string();
+    Some(new_image_ref.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Config, UpdateStrategy};
-    use std::io::Write;
-    use tempfile::NamedTempFile;
 
-    #[tokio::test]
-    async fn test_prevents_downgrade() {
-        let mut config = Config::default();
-        config.update_strategy = UpdateStrategy::Latest;
-        config.dry_run = true;
+    fn version_infos(tags: &[&str]) -> Vec<VersionInfo> {
+        tags.iter()
+            .map(|t| VersionInfo::from_tag(t).unwrap())
+            .collect()
+    }
 
-        let updater = ComposeUpdater::new(config);
+    #[test]
+    fn test_choose_new_tag_upgrades_to_higher_version() {
+        let image = ImageRef::parse("nginx:1.25.0").unwrap();
+        let current = Version::parse("1.25.0").unwrap();
+        let available = version_infos(&["1.25.0", "1.26.0", "1.24.0"]);
 
-        // Create a temporary compose file with a higher version
-        let mut temp_file = NamedTempFile::new().unwrap();
-        writeln!(temp_file, "services:\n  web:\n    image: nginx:1.25.0").unwrap();
+        let result = choose_new_tag(
+            &image,
+            &current,
+            &available,
+            None,
+            None,
+            &UpdateStrategy::Latest,
+        );
+        assert_eq!(result, Some("nginx:1.26.0".to_string()));
+    }
 
-        let file_path = temp_file.path().to_str().unwrap();
-        let compose_file = updater.parse_compose_file(file_path).unwrap();
+    #[test]
+    fn test_choose_new_tag_prevents_downgrade() {
+        let image = ImageRef::parse("nginx:1.25.0").unwrap();
+        let current = Version::parse("1.25.0").unwrap();
+        // Registry only offers older versions.
+        let available = version_infos(&["1.24.0", "1.23.5"]);
 
-        assert_eq!(compose_file.services.len(), 1);
-        let service = &compose_file.services[0];
+        let result = choose_new_tag(
+            &image,
+            &current,
+            &available,
+            None,
+            None,
+            &UpdateStrategy::Latest,
+        );
+        assert!(result.is_none(), "should never downgrade");
+    }
 
-        // Mock a scenario where the strategy selects a lower version
-        // This would happen if available versions only include older versions
-        let (current_version, _, _, _) = parse_version_tag(&service.image_ref.tag);
-        assert!(current_version.is_some());
+    #[test]
+    fn test_choose_new_tag_skips_equal_version() {
+        let image = ImageRef::parse("nginx:1.25.0").unwrap();
+        let current = Version::parse("1.25.0").unwrap();
+        let available = version_infos(&["1.25.0"]);
 
-        // The actual test would need mocked registry responses, but we can verify
-        // the logic by checking that current version is properly extracted
-        assert_eq!(current_version.unwrap().to_string(), "1.25.0");
+        let result = choose_new_tag(
+            &image,
+            &current,
+            &available,
+            None,
+            None,
+            &UpdateStrategy::Latest,
+        );
+        assert!(result.is_none(), "no rewrite when already on the latest");
+    }
+
+    #[test]
+    fn test_choose_new_tag_respects_prefix_and_suffix() {
+        let image = ImageRef::parse("nginx:v1.25.0-alpine").unwrap();
+        let current = Version::parse("1.25.0").unwrap();
+        let available = vec![
+            VersionInfo::from_tag("v1.26.0-alpine").unwrap(),
+            VersionInfo::from_tag("1.27.0").unwrap(), // no matching prefix/suffix
+            VersionInfo::from_tag("v1.26.0").unwrap(), // missing suffix
+        ];
+
+        let result = choose_new_tag(
+            &image,
+            &current,
+            &available,
+            Some("v".to_string()),
+            Some("-alpine".to_string()),
+            &UpdateStrategy::Latest,
+        );
+        assert_eq!(result, Some("nginx:v1.26.0-alpine".to_string()));
     }
 }
