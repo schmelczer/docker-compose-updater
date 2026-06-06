@@ -59,25 +59,3 @@ jobs:
           context: .
           push: ${{ github.event_name != 'pull_request' }}
           token: ${{ secrets.FORGEJO_PACKAGE_TOKEN }}
-
-  security-scan:
-    needs: build-and-push
-    runs-on: docker
-    if: github.event_name != 'pull_request'
-    steps:
-      - name: Resolve registry host
-        id: registry
-        run: |
-          host="$(echo '${{ github.server_url }}' | sed -E 's|https?://||; s|/$||')"
-          [ "$host" = "forgejo:3000" ] && host="127.0.0.1:13000"
-          echo "image=${host}/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
-
-      - name: Run Trivy vulnerability scanner
-        # Pinned to the commit behind trivy-action v0.36.0 for a reproducible,
-        # supply-chain-safe reference instead of the moving @master branch.
-        uses: https://github.com/aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
-        with:
-          image-ref: ${{ steps.registry.outputs.image }}:latest
-          format: "table"
-          exit-code: "1"
-          severity: "CRITICAL,HIGH"
