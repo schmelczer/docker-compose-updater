@@ -83,6 +83,23 @@ impl Scheduler {
                     ));
                 }
 
+                // A degraded run (some services/files failed) still applied the
+                // updates that succeeded, but the operator must see the failure:
+                // health stays binary and fails closed.
+                if !report.errors.is_empty() {
+                    for err in &report.errors {
+                        error!("Update error: {}", err);
+                    }
+                    if let Some(health) = &self.health_handle {
+                        health.report_update_failure();
+                    }
+                    return Err(anyhow!(
+                        "Update cycle completed with {} error(s); {} file(s) updated",
+                        report.errors.len(),
+                        report.updated_files.len()
+                    ));
+                }
+
                 if report.updated_files.is_empty() {
                     info!(
                         "Update cycle completed in {:?} - scanned {} files, none updated",

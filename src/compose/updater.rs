@@ -25,6 +25,11 @@ pub struct ComposeUpdater {
 pub struct UpdateReport {
     pub files_found: usize,
     pub updated_files: Vec<String>,
+    /// Human-readable failures collected during the run (one per failed service,
+    /// file, or path). Non-empty means the cycle was degraded but did not abort:
+    /// every other service and file was still processed and successful updates
+    /// were still written.
+    pub errors: Vec<String>,
 }
 
 impl ComposeUpdater {
@@ -40,15 +45,29 @@ impl ComposeUpdater {
     pub async fn update_all_compose_files(&self) -> Result<UpdateReport> {
         let mut updated_files = Vec::new();
         let mut files_found = 0;
+        let mut errors = Vec::new();
 
         for compose_path in &self.config.compose_paths {
-            let compose_files = self.find_compose_files(compose_path)?;
+            let compose_files = match self.find_compose_files(compose_path) {
+                Ok(files) => files,
+                Err(e) => {
+                    errors.push(format!("path {}: {:#}", compose_path.display(), e));
+                    continue;
+                }
+            };
             files_found += compose_files.len();
 
             for file_path in compose_files {
-                let updated = self.update_compose_file(&file_path).await?;
-                if updated {
-                    updated_files.push(file_path);
+                // A failure on one file (or one service within it) must not abort
+                // the rest of the run: collect it and keep going.
+                match self.update_compose_file(&file_path).await {
+                    Ok((updated, file_errors)) => {
+                        if updated {
+                            updated_files.push(file_path);
+                        }
+                        errors.extend(file_errors);
+                    }
+                    Err(e) => errors.push(format!("file {}: {:#}", file_path, e)),
                 }
             }
         }
@@ -56,6 +75,7 @@ impl ComposeUpdater {
         Ok(UpdateReport {
             files_found,
             updated_files,
+            errors,
         })
     }
 
@@ -63,11 +83,16 @@ impl ComposeUpdater {
         self.parser.parse_file(file_path)
     }
 
-    async fn update_compose_file(&self, file_path: &str) -> Result<bool> {
+    /// Updates every service in a single compose file. Returns whether the file
+    /// was modified along with a list of per-service failures. A transient
+    /// registry error on one service is recorded and skipped rather than
+    /// aborting the file, so unrelated services still get updated and written.
+    async fn update_compose_file(&self, file_path: &str) -> Result<(bool, Vec<String>)> {
         info!("Processing compose file: {}", file_path);
 
         let compose_file = self.parse_compose_file(file_path)?;
         let mut updated = false;
+        let mut errors = Vec::new();
         let mut new_content = compose_file.content.clone();
 
         for service in &compose_file.services {
@@ -77,15 +102,25 @@ impl ComposeUpdater {
             }
 
             match self.update_service_image(service).await {
-                Ok(Some(new_image)) => {
-                    new_content =
-                        self.replace_image_in_content(&new_content, service, &new_image)?;
-                    updated = true;
-                    info!(
-                        "Updated {}: {} -> {}",
-                        service.service_name, service.image_ref, new_image
-                    );
-                }
+                Ok(Some(new_image)) => match self.replace_image_in_content(
+                    &new_content,
+                    service,
+                    &new_image,
+                ) {
+                    Ok(replaced) => {
+                        new_content = replaced;
+                        updated = true;
+                        info!(
+                            "Updated {}: {} -> {}",
+                            service.service_name, service.image_ref, new_image
+                        );
+                    }
+                    Err(e) => {
+                        let msg = format!("service {}: {:#}", service.service_name, e);
+                        warn!("Failed to update {} in {}", msg, file_path);
+                        errors.push(msg);
+                    }
+                },
                 Ok(None) => {
                     debug!(
                         "No update needed for {}: {}",
@@ -93,9 +128,9 @@ impl ComposeUpdater {
                     );
                 }
                 Err(e) => {
-                    return Err(
-                        e.context(format!("Failed to update service {}", service.service_name))
-                    );
+                    let msg = format!("service {}: {:#}", service.service_name, e);
+                    warn!("Failed to update {} in {}", msg, file_path);
+                    errors.push(msg);
                 }
             }
         }
@@ -104,7 +139,7 @@ impl ComposeUpdater {
             self.write_updated_content(file_path, new_content)?;
         }
 
-        Ok(updated)
+        Ok((updated, errors))
     }
 
     fn write_updated_content(&self, file_path: &str, content: String) -> Result<()> {

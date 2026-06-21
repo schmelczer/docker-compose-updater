@@ -172,6 +172,74 @@ async fn test_compose_update_with_empty_paths() {
     let result = updater.update_all_compose_files().await.unwrap();
     assert_eq!(result.files_found, 0);
     assert!(result.updated_files.is_empty());
+    assert!(result.errors.is_empty());
+}
+
+#[tokio::test]
+async fn test_update_continues_after_service_failure() {
+    // Two services point at registries absent from the config, so each fails
+    // fast with "Unknown registry" (no network). With an empty registry map and
+    // a non-semver tag, the third service is skipped without error. This proves
+    // a failure on the first service no longer aborts the run before the second.
+    let temp_dir = TempDir::new().unwrap();
+    let compose_path = temp_dir.path().join("stack.yml");
+    std::fs::write(
+        &compose_path,
+        "services:\n  \
+           skipped:\n    image: nginx:latest\n  \
+           bad_one:\n    image: unknown.registry.example/foo/app:1.0.0\n  \
+           bad_two:\n    image: another.unknown.example/bar/app:2.0.0\n",
+    )
+    .unwrap();
+
+    let config = Config {
+        compose_paths: vec![temp_dir.path().to_path_buf()],
+        schedule: "0 0 2 * * *".to_string(),
+        registries: HashMap::new(),
+        update_strategy: UpdateStrategy::Latest,
+        ignore_images: vec![],
+        dry_run: true,
+    };
+
+    let updater = ComposeUpdater::new(config);
+    let report = updater.update_all_compose_files().await.unwrap();
+
+    assert_eq!(report.files_found, 1);
+    assert!(report.updated_files.is_empty());
+    assert_eq!(
+        report.errors.len(),
+        2,
+        "both failing services should be attempted and recorded, got: {:?}",
+        report.errors
+    );
+}
+
+#[tokio::test]
+async fn test_scheduler_reports_failure_on_service_error() {
+    // A degraded cycle (a service that cannot be resolved) must surface as an
+    // error from run_once even though the run itself did not abort.
+    let temp_dir = TempDir::new().unwrap();
+    let compose_path = temp_dir.path().join("stack.yml");
+    std::fs::write(
+        &compose_path,
+        "services:\n  bad:\n    image: unknown.registry.example/foo/app:1.0.0\n",
+    )
+    .unwrap();
+
+    let config = Config {
+        compose_paths: vec![temp_dir.path().to_path_buf()],
+        schedule: "0 0 2 * * *".to_string(),
+        registries: HashMap::new(),
+        update_strategy: UpdateStrategy::Latest,
+        ignore_images: vec![],
+        dry_run: true,
+    };
+
+    let scheduler = Scheduler::new(config, None).unwrap();
+    assert!(
+        scheduler.run_once().await.is_err(),
+        "a cycle where a service fails to update should report an error"
+    );
 }
 
 #[test]

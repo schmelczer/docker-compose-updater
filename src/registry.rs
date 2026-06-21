@@ -2,20 +2,35 @@ use crate::config::{Config, RegistryConfig};
 use crate::version::VersionInfo;
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
-use reqwest::{Client as HttpClient, Response, StatusCode};
+use reqwest::{header::HeaderMap, Client as HttpClient, Response, StatusCode};
 use serde::Deserialize;
 use std::sync::LazyLock;
 use std::time::Duration;
 use tokio::time::sleep;
 use tracing::{debug, warn};
 
-const PAGE_SIZE: usize = 500;
-const MAX_PAGES: usize = 100;
+// Docker Hub silently clamps page_size to 100, so request exactly that.
+const DOCKERHUB_PAGE_SIZE: usize = 100;
+// ghcr.io / lscr.io (and distribution-spec registries) cap `n` at 1000; a larger
+// value is clamped, so 1000 minimises the number of requests (and thus 429s).
+const OCI_PAGE_SIZE: usize = 1000;
+// Upper bound on tags fetched per image, as a runaway guard only. Tag listings on
+// Docker Hub and ghcr.io/lscr.io are NOT ordered by version (Docker Hub's order is
+// undefined; ghcr.io/lscr.io are chronological), so we must scan the whole list to
+// reliably find the highest version rather than truncate and risk missing it. Real
+// repos (e.g. jellyfin/jellyfin at ~13.6k tags) finish far below this; hitting it
+// means the result may be incomplete and is logged loudly.
+const MAX_TAGS_SCANNED: usize = 50_000;
 const MAX_RETRY_ATTEMPTS: u32 = 5;
 const MAX_AUTH_ATTEMPTS: u32 = 2;
 const INITIAL_RETRY_DELAY_SECS: u64 = 1;
 const HTTP_TIMEOUT_SECS: u64 = 30;
 const HTTP_CONNECT_TIMEOUT_SECS: u64 = 10;
+// Evict idle keep-alive connections well before registries (Docker Hub, GHCR,
+// lscr.io) close them server-side. Reusing a connection the server has already
+// dropped is what surfaces as "connection closed before message completed";
+// recycling early makes that race rare, and `fetch_with_retry` covers the rest.
+const POOL_IDLE_TIMEOUT_SECS: u64 = 30;
 
 #[derive(Debug, Clone)]
 pub struct ImageRef {
@@ -97,6 +112,16 @@ struct DockerHubTag {
     name: String,
 }
 
+/// A fully-read HTTP response. The body is read inside the retry scope so that a
+/// connection dropped mid-body is retried like any other transport failure;
+/// callers therefore receive the body as an owned string rather than a streaming
+/// `Response`, while retaining the status and headers they need.
+struct FetchResult {
+    status: StatusCode,
+    headers: HeaderMap,
+    body: String,
+}
+
 pub struct Client {
     http_client: HttpClient,
     config: Config,
@@ -107,6 +132,7 @@ impl Client {
         let http_client = HttpClient::builder()
             .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
             .connect_timeout(Duration::from_secs(HTTP_CONNECT_TIMEOUT_SECS))
+            .pool_idle_timeout(Duration::from_secs(POOL_IDLE_TIMEOUT_SECS))
             .build()
             .expect("failed to build HTTP client");
 
@@ -132,11 +158,11 @@ impl Client {
         None
     }
 
-    async fn request_with_retry<F, Fut>(
+    async fn fetch_with_retry<F, Fut>(
         &self,
         request_fn: F,
         operation_name: &str,
-    ) -> Result<Response>
+    ) -> Result<FetchResult>
     where
         F: Fn() -> Fut,
         Fut: std::future::Future<Output = Result<Response, reqwest::Error>>,
@@ -145,9 +171,49 @@ impl Client {
         let mut delay = Duration::from_secs(INITIAL_RETRY_DELAY_SECS);
 
         loop {
-            let response = request_fn().await?;
+            // Send the request AND read the body as one retryable unit: a
+            // connection dropped while streaming the body (`is_body`) is just as
+            // transient as one dropped while sending the request (`is_request`),
+            // and reading it here lets both be retried.
+            let fetched = async {
+                let response = request_fn().await?;
+                let status = response.status();
+                let headers = response.headers().clone();
+                let body = response.text().await?;
+                Ok::<_, reqwest::Error>(FetchResult {
+                    status,
+                    headers,
+                    body,
+                })
+            }
+            .await;
 
-            if response.status() == StatusCode::TOO_MANY_REQUESTS {
+            let fetched = match fetched {
+                Ok(fetched) => fetched,
+                Err(err) => {
+                    attempt += 1;
+
+                    // Transient transport failures (connect timeouts, dropped
+                    // keep-alive connections) never reached this retry path
+                    // before and aborted the whole update run. Retry them with
+                    // the same bounded, exponential backoff used for 429s.
+                    if !is_transient_transport_error(&err) || attempt > MAX_RETRY_ATTEMPTS {
+                        return Err(anyhow::Error::new(err)
+                            .context(format!("{operation_name} failed")));
+                    }
+
+                    warn!(
+                        "{} transient transport error ({}), attempt {}/{}, waiting {:?} before retry",
+                        operation_name, err, attempt, MAX_RETRY_ATTEMPTS, delay
+                    );
+
+                    sleep(delay).await;
+                    delay = delay.saturating_mul(2);
+                    continue;
+                }
+            };
+
+            if fetched.status == StatusCode::TOO_MANY_REQUESTS {
                 attempt += 1;
 
                 if attempt > MAX_RETRY_ATTEMPTS {
@@ -158,8 +224,8 @@ impl Client {
                     ));
                 }
 
-                let wait_duration = if let Some(retry_after) = response
-                    .headers()
+                let wait_duration = if let Some(retry_after) = fetched
+                    .headers
                     .get("retry-after")
                     .and_then(|h| h.to_str().ok())
                 {
@@ -177,7 +243,7 @@ impl Client {
 
                 delay = delay.saturating_mul(2);
             } else {
-                return Ok(response);
+                return Ok(fetched);
             }
         }
     }
@@ -199,13 +265,17 @@ impl Client {
         }
     }
 
+    /// Returns the semver-parseable versions on the page, the URL of the next
+    /// page (if any), and the raw number of tags on the page (including
+    /// non-semver tags, used to budget the total scan).
     fn parse_dockerhub_response(
         &self,
         response_text: &str,
-    ) -> Result<(Vec<VersionInfo>, Option<String>)> {
+    ) -> Result<(Vec<VersionInfo>, Option<String>, usize)> {
         let dockerhub_response: DockerHubTagsResponse = serde_json::from_str(response_text)
             .map_err(|e| anyhow!("Failed to parse Docker Hub response: {}", e))?;
 
+        let raw_count = dockerhub_response.results.len();
         let mut versions = Vec::new();
 
         for tag in dockerhub_response.results {
@@ -214,19 +284,29 @@ impl Client {
             }
         }
 
-        Ok((versions, dockerhub_response.next))
+        Ok((versions, dockerhub_response.next, raw_count))
     }
 
-    fn parse_v2_response(&self, response_text: &str) -> Result<Vec<VersionInfo>> {
+    /// Returns the semver-parseable versions on the page, the raw last tag (the
+    /// `last=` cursor for the next page, regardless of whether it parsed as
+    /// semver), and the raw number of tags on the page.
+    fn parse_v2_response(
+        &self,
+        response_text: &str,
+    ) -> Result<(Vec<VersionInfo>, Option<String>, usize)> {
         debug!("Parsing registry v2 response: {}", response_text);
         let tags_response: serde_json::Value = serde_json::from_str(response_text)
             .map_err(|e| anyhow!("Failed to parse registry response: {}", e))?;
 
         let mut versions = Vec::new();
+        let mut raw_last_tag = None;
+        let mut raw_count = 0;
 
         if let Some(tags) = tags_response.get("tags").and_then(|t| t.as_array()) {
             for tag in tags {
                 if let Some(tag_str) = tag.as_str() {
+                    raw_count += 1;
+                    raw_last_tag = Some(tag_str.to_string());
                     if let Some(version_info) = VersionInfo::from_tag(tag_str) {
                         versions.push(version_info);
                     }
@@ -234,7 +314,7 @@ impl Client {
             }
         }
 
-        Ok(versions)
+        Ok((versions, raw_last_tag, raw_count))
     }
 
     pub async fn get_available_versions(&self, image_ref: &ImageRef) -> Result<Vec<VersionInfo>> {
@@ -248,50 +328,50 @@ impl Client {
     async fn get_dockerhub_versions(&self, image_ref: &ImageRef) -> Result<Vec<VersionInfo>> {
         let repo_path = self.build_repository_path(image_ref);
         let mut results = Vec::new();
-        let mut page_count: usize = 0;
+        let mut tags_scanned: usize = 0;
         let mut url = format!(
-            "https://hub.docker.com/v2/repositories/{repo_path}/tags/?page_size={PAGE_SIZE}"
+            "https://hub.docker.com/v2/repositories/{repo_path}/tags/?page_size={DOCKERHUB_PAGE_SIZE}"
         );
 
         loop {
             debug!("Docker Hub API URL: {}", url);
 
             let url_clone = url.clone();
-            let response = self
-                .request_with_retry(
+            let fetched = self
+                .fetch_with_retry(
                     || async { self.http_client.get(&url_clone).send().await },
                     "Docker Hub API request",
                 )
                 .await?;
-            debug!("Docker Hub response status: {}", response.status());
+            debug!("Docker Hub response status: {}", fetched.status);
 
-            if !response.status().is_success() {
+            if !fetched.status.is_success() {
                 return Err(anyhow!(
                     "Docker Hub request failed with status {}: {}",
-                    response.status(),
-                    response.text().await.unwrap_or_default()
+                    fetched.status,
+                    fetched.body
                 ));
             }
 
-            let response_text = response.text().await?;
+            let (new_tags, next_page, raw_count) = self.parse_dockerhub_response(&fetched.body)?;
 
-            let (new_tags, next_page) = self.parse_dockerhub_response(&response_text)?;
-
+            tags_scanned += raw_count;
             results.extend(new_tags);
 
-            page_count += 1;
-            if page_count >= MAX_PAGES {
+            if tags_scanned >= MAX_TAGS_SCANNED {
                 warn!(
-                    "Reached maximum page count ({}) for {}, stopping pagination",
-                    MAX_PAGES, image_ref
+                    "Reached the {}-tag scan limit for {} before exhausting the registry; \
+                     the newest version may have been missed",
+                    MAX_TAGS_SCANNED, image_ref
                 );
                 break;
             }
 
-            if let Some(next) = next_page {
-                url = next;
-            } else {
-                break;
+            match next_page {
+                // Advance only on a non-empty page with a distinct next link;
+                // stop on the last page, an empty page, or a self-referential link.
+                Some(next) if raw_count > 0 && next != url => url = next,
+                _ => break,
             }
         }
 
@@ -307,7 +387,7 @@ impl Client {
         let mut next_url: Option<String> = None;
         let mut bearer_token: Option<String> = None;
         let mut auth_attempts: u32 = 0;
-        let mut page_count: usize = 0;
+        let mut tags_scanned: usize = 0;
 
         loop {
             let url = if let Some(next) = next_url.take() {
@@ -318,7 +398,7 @@ impl Client {
                 }
             } else {
                 format!(
-                    "{}/v2/{repo_path}/tags/list?n={PAGE_SIZE}{}",
+                    "{}/v2/{repo_path}/tags/list?n={OCI_PAGE_SIZE}{}",
                     registry_config.url,
                     if let Some(ref last) = last_tag {
                         format!("&last={last}")
@@ -332,8 +412,8 @@ impl Client {
 
             let url_clone = url.clone();
             let bearer_token_clone = bearer_token.clone();
-            let response = self
-                .request_with_retry(
+            let fetched = self
+                .fetch_with_retry(
                     || async {
                         let mut request_builder = self.http_client.get(&url_clone);
                         if let Some(token) = &bearer_token_clone {
@@ -345,70 +425,78 @@ impl Client {
                 )
                 .await?;
 
-            let (new_tags, link_next) = if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-                if auth_attempts >= MAX_AUTH_ATTEMPTS {
-                    return Err(anyhow!(
-                        "Authentication failed after {} attempts for registry {}",
-                        auth_attempts,
-                        image_ref.registry
-                    ));
-                }
-                if let Some(token) = &registry_config.auth_token {
-                    if let Some(auth_header) = response.headers().get("www-authenticate") {
-                        let auth_str = auth_header.to_str().map_err(|e| {
-                            anyhow!("Invalid WWW-Authenticate header encoding: {}", e)
-                        })?;
-                        bearer_token = self.try_registry_v2_auth(auth_str, token).await?;
-                        auth_attempts += 1;
-                        continue;
-                    } else {
+            let (new_tags, raw_last_tag, raw_count, link_next) =
+                if fetched.status == reqwest::StatusCode::UNAUTHORIZED {
+                    if auth_attempts >= MAX_AUTH_ATTEMPTS {
                         return Err(anyhow!(
-                            "Unauthorized request but no WWW-Authenticate header found"
+                            "Authentication failed after {} attempts for registry {}",
+                            auth_attempts,
+                            image_ref.registry
                         ));
                     }
+                    if let Some(token) = &registry_config.auth_token {
+                        if let Some(auth_header) = fetched.headers.get("www-authenticate") {
+                            let auth_str = auth_header.to_str().map_err(|e| {
+                                anyhow!("Invalid WWW-Authenticate header encoding: {}", e)
+                            })?;
+                            bearer_token = self.try_registry_v2_auth(auth_str, token).await?;
+                            auth_attempts += 1;
+                            continue;
+                        } else {
+                            return Err(anyhow!(
+                                "Unauthorized request but no WWW-Authenticate header found"
+                            ));
+                        }
+                    } else {
+                        return Err(anyhow!("Unauthorized request but no auth token configured"));
+                    }
+                } else if fetched.status.is_success() {
+                    let link_next = fetched
+                        .headers
+                        .get("link")
+                        .and_then(|h| h.to_str().ok())
+                        .and_then(|h| self.parse_link_header(h));
+
+                    let (tags, raw_last_tag, raw_count) = self.parse_v2_response(&fetched.body)?;
+                    (tags, raw_last_tag, raw_count, link_next)
                 } else {
-                    return Err(anyhow!("Unauthorized request but no auth token configured"));
-                }
-            } else if response.status().is_success() {
-                let link_next = response
-                    .headers()
-                    .get("link")
-                    .and_then(|h| h.to_str().ok())
-                    .and_then(|h| self.parse_link_header(h));
+                    return Err(anyhow!(
+                        "Registry request failed with status {}: {}",
+                        fetched.status,
+                        fetched.body
+                    ));
+                };
 
-                let response_text = response.text().await?;
-                let tags = self.parse_v2_response(&response_text)?;
-                (tags, link_next)
-            } else {
-                let status = response.status();
-                let error_text = response.text().await.unwrap_or_default();
-                return Err(anyhow!(
-                    "Registry request failed with status {}: {}",
-                    status,
-                    error_text
-                ));
-            };
+            tags_scanned += raw_count;
+            results.extend(new_tags);
 
-            page_count += 1;
-            if page_count >= MAX_PAGES {
+            if tags_scanned >= MAX_TAGS_SCANNED {
                 warn!(
-                    "Reached maximum page count ({}) for {}, stopping pagination",
-                    MAX_PAGES, image_ref
+                    "Reached the {}-tag scan limit for {} before exhausting the registry; \
+                     the newest version may have been missed",
+                    MAX_TAGS_SCANNED, image_ref
                 );
-                results.extend(new_tags);
                 break;
             }
 
-            let maybe_last_tag = new_tags.last().map(|v| v.original.clone());
-            results.extend(new_tags);
-
+            // Advance via the registry's Link header when present, else the raw
+            // last-tag cursor. Stop on an empty page, a Link header that points
+            // back at the current page, or a cursor that did not move.
             if let Some(next) = link_next {
-                next_url = Some(next);
-            } else if let Some(ref last) = maybe_last_tag {
-                if last_tag.as_ref() == Some(last) {
+                let resolved = if next.starts_with("http://") || next.starts_with("https://") {
+                    next
+                } else {
+                    format!("{}{next}", registry_config.url)
+                };
+                if resolved == url {
                     break;
                 }
-                last_tag = maybe_last_tag;
+                next_url = Some(resolved);
+            } else if let Some(last) = raw_last_tag {
+                if raw_count == 0 || last_tag.as_ref() == Some(&last) {
+                    break;
+                }
+                last_tag = Some(last);
             } else {
                 break;
             }
@@ -432,7 +520,7 @@ impl Client {
         let auth_url_clone = auth_url.clone();
         let token_clone = token.to_string();
         let token_response = self
-            .request_with_retry(
+            .fetch_with_retry(
                 || async {
                     self.http_client
                         .get(&auth_url_clone)
@@ -444,15 +532,16 @@ impl Client {
             )
             .await?;
 
-        if !token_response.status().is_success() {
+        if !token_response.status.is_success() {
             return Err(anyhow!(
                 "Failed to get token: {} - {}",
-                token_response.status(),
-                token_response.text().await.unwrap_or_default()
+                token_response.status,
+                token_response.body
             ));
         }
 
-        let token_json: serde_json::Value = token_response.json().await?;
+        let token_json: serde_json::Value = serde_json::from_str(&token_response.body)
+            .map_err(|e| anyhow!("Failed to parse auth token response: {}", e))?;
 
         if let Some(registry_token) = token_json.get("token").and_then(|t| t.as_str()) {
             return Ok(Some(registry_token.to_string()));
@@ -483,6 +572,18 @@ impl Client {
 
 static AUTH_PARAM_REGEX: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r#"(\w+)="([^"]+)""#).unwrap());
+
+/// Returns true for transient transport-level failures worth retrying:
+/// connection-establishment failures (`tcp connect error: deadline has elapsed`),
+/// read/overall timeouts, request-send failures such as hyper's `IncompleteMessage`
+/// (`connection closed before message completed`), and body-read failures from a
+/// connection dropped mid-stream. Because `fetch_with_retry` reads the body inside
+/// the retry scope, `is_body` is meaningful here. Non-transient kinds (`is_decode`,
+/// redirect, builder, and HTTP status errors, which arrive as a successful
+/// `Response` rather than an `Err`) are not retried.
+fn is_transient_transport_error(err: &reqwest::Error) -> bool {
+    err.is_connect() || err.is_timeout() || err.is_request() || err.is_body()
+}
 
 fn extract_auth_param(auth_str: &str, param: &str) -> Result<String> {
     for caps in AUTH_PARAM_REGEX.captures_iter(auth_str) {
@@ -593,6 +694,70 @@ mod tests {
             tag: "v1.0.0".to_string(),
         };
         assert_eq!(client.build_repository_path(&image_ref), "user/app");
+    }
+
+    #[tokio::test]
+    async fn test_connect_failure_is_transient() {
+        // 192.0.2.1 is TEST-NET-1 (RFC 5737): guaranteed non-routable, so the
+        // connect attempt fails (timeout or unreachable). Either way it must be
+        // classified as a transient transport error so it gets retried.
+        let client = HttpClient::builder()
+            .connect_timeout(Duration::from_millis(50))
+            .timeout(Duration::from_millis(200))
+            .build()
+            .unwrap();
+
+        let err = client
+            .get("http://192.0.2.1:9/")
+            .send()
+            .await
+            .expect_err("connecting to a non-routable address must fail");
+
+        assert!(
+            is_transient_transport_error(&err),
+            "connect failure should be retryable, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_v2_response_reports_raw_cursor_and_count() {
+        let client = Client::new(Config::default());
+
+        // Mixed semver and non-semver tags. The raw cursor must be the literal
+        // last tag (even though it is not semver) so pagination advances past it,
+        // and the raw count must include every tag for the scan budget.
+        let body = r#"{"name":"linuxserver/radarr","tags":["6.1.0","6.1.1","latest","amd64-nightly"]}"#;
+        let (versions, raw_last_tag, raw_count) = client.parse_v2_response(body).unwrap();
+
+        assert_eq!(raw_count, 4);
+        assert_eq!(raw_last_tag.as_deref(), Some("amd64-nightly"));
+        let parsed: Vec<_> = versions.iter().map(|v| v.original.as_str()).collect();
+        assert_eq!(parsed, vec!["6.1.0", "6.1.1"]);
+    }
+
+    #[test]
+    fn test_parse_v2_response_handles_empty_and_null_tags() {
+        let client = Client::new(Config::default());
+
+        for body in [r#"{"name":"x","tags":[]}"#, r#"{"name":"x","tags":null}"#] {
+            let (versions, raw_last_tag, raw_count) = client.parse_v2_response(body).unwrap();
+            assert!(versions.is_empty());
+            assert_eq!(raw_last_tag, None);
+            assert_eq!(raw_count, 0, "body {body} should yield zero raw tags");
+        }
+    }
+
+    #[test]
+    fn test_parse_dockerhub_response_reports_raw_count_and_next() {
+        let client = Client::new(Config::default());
+
+        let body = r#"{"count":3,"next":"https://hub.docker.com/v2/repositories/jellyfin/jellyfin/tags/?page=2&page_size=100","results":[{"name":"10.10.7"},{"name":"latest"},{"name":"10.10.6"}]}"#;
+        let (versions, next, raw_count) = client.parse_dockerhub_response(body).unwrap();
+
+        assert_eq!(raw_count, 3);
+        assert!(next.unwrap().contains("page=2"));
+        let parsed: Vec<_> = versions.iter().map(|v| v.original.as_str()).collect();
+        assert_eq!(parsed, vec!["10.10.7", "10.10.6"]);
     }
 
     #[test]
