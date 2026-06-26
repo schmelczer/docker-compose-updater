@@ -102,25 +102,23 @@ impl ComposeUpdater {
             }
 
             match self.update_service_image(service).await {
-                Ok(Some(new_image)) => match self.replace_image_in_content(
-                    &new_content,
-                    service,
-                    &new_image,
-                ) {
-                    Ok(replaced) => {
-                        new_content = replaced;
-                        updated = true;
-                        info!(
-                            "Updated {}: {} -> {}",
-                            service.service_name, service.image_ref, new_image
-                        );
+                Ok(Some(new_image)) => {
+                    match self.replace_image_in_content(&new_content, service, &new_image) {
+                        Ok(replaced) => {
+                            new_content = replaced;
+                            updated = true;
+                            info!(
+                                "Updated {}: {} -> {}",
+                                service.service_name, service.image_ref, new_image
+                            );
+                        }
+                        Err(e) => {
+                            let msg = format!("service {}: {:#}", service.service_name, e);
+                            warn!("Failed to update {} in {}", msg, file_path);
+                            errors.push(msg);
+                        }
                     }
-                    Err(e) => {
-                        let msg = format!("service {}: {:#}", service.service_name, e);
-                        warn!("Failed to update {} in {}", msg, file_path);
-                        errors.push(msg);
-                    }
-                },
+                }
                 Ok(None) => {
                     debug!(
                         "No update needed for {}: {}",

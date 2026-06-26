@@ -198,8 +198,9 @@ impl Client {
                     // before and aborted the whole update run. Retry them with
                     // the same bounded, exponential backoff used for 429s.
                     if !is_transient_transport_error(&err) || attempt > MAX_RETRY_ATTEMPTS {
-                        return Err(anyhow::Error::new(err)
-                            .context(format!("{operation_name} failed")));
+                        return Err(
+                            anyhow::Error::new(err).context(format!("{operation_name} failed"))
+                        );
                     }
 
                     warn!(
@@ -726,7 +727,8 @@ mod tests {
         // Mixed semver and non-semver tags. The raw cursor must be the literal
         // last tag (even though it is not semver) so pagination advances past it,
         // and the raw count must include every tag for the scan budget.
-        let body = r#"{"name":"linuxserver/radarr","tags":["6.1.0","6.1.1","latest","amd64-nightly"]}"#;
+        let body =
+            r#"{"name":"linuxserver/radarr","tags":["6.1.0","6.1.1","latest","amd64-nightly"]}"#;
         let (versions, raw_last_tag, raw_count) = client.parse_v2_response(body).unwrap();
 
         assert_eq!(raw_count, 4);
