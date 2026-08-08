@@ -24,7 +24,16 @@ pub struct Config {
 pub struct RegistryConfig {
     pub url: String,
     pub auth_token: Option<String>,
+    /// Basic-auth username paired with `auth_token` when exchanging a registry
+    /// challenge for a bearer token. ghcr.io and GitLab ignore it (the token
+    /// carries the identity), hence the "token" default; Docker Hub validates it
+    /// and rejects anything but the real account name, so a `dckr_pat_…` token
+    /// needs the owning username set here.
+    pub username: Option<String>,
 }
+
+/// Username used with `auth_token` when a registry config does not set one.
+pub const DEFAULT_AUTH_USERNAME: &str = "token";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub enum UpdateStrategy {
@@ -41,6 +50,7 @@ impl Default for Config {
             RegistryConfig {
                 url: "https://registry-1.docker.io".to_string(),
                 auth_token: None,
+                username: None,
             },
         );
         registries.insert(
@@ -48,6 +58,7 @@ impl Default for Config {
             RegistryConfig {
                 url: "https://ghcr.io".to_string(),
                 auth_token: std::env::var("GITHUB_TOKEN").ok(),
+                username: None,
             },
         );
 
@@ -69,7 +80,18 @@ impl Config {
         let expanded_content = Self::expand_env_vars(&content);
         let mut config: Self = serde_yaml::from_str(&expanded_content)?;
         config.normalize_auth_tokens();
+        config.restore_missing_default_registries();
         Ok(config)
+    }
+
+    /// A `registries` block in the config file replaces the defaults wholesale
+    /// rather than merging, so one that lists only (say) ghcr.io would leave
+    /// Docker Hub unresolvable. Put the defaults back for any key the file did
+    /// not set; an explicit entry always wins.
+    fn restore_missing_default_registries(&mut self) {
+        for (name, registry) in Self::default().registries {
+            self.registries.entry(name).or_insert(registry);
+        }
     }
 
     pub fn expand_env_vars(content: &str) -> String {

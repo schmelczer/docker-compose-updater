@@ -177,6 +177,7 @@ async fn test_ghcr_authentication_e2e() {
         RegistryConfig {
             url: "https://registry-1.docker.io".to_string(),
             auth_token: None,
+            username: None,
         },
     );
     registries.insert(
@@ -184,6 +185,7 @@ async fn test_ghcr_authentication_e2e() {
         RegistryConfig {
             url: "https://ghcr.io".to_string(),
             auth_token: Some(github_token),
+            username: None,
         },
     );
 
@@ -214,6 +216,7 @@ fn create_test_config() -> Config {
         RegistryConfig {
             url: "https://registry-1.docker.io".to_string(),
             auth_token: None,
+            username: None,
         },
     );
 

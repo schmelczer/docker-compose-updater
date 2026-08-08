@@ -488,6 +488,7 @@ fn create_test_config() -> Config {
         RegistryConfig {
             url: "https://registry-1.docker.io".to_string(),
             auth_token: None,
+            username: None,
         },
     );
     registries.insert(
@@ -495,6 +496,7 @@ fn create_test_config() -> Config {
         RegistryConfig {
             url: "https://ghcr.io".to_string(),
             auth_token: None,
+            username: None,
         },
     );
 

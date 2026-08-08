@@ -1,25 +1,24 @@
-use crate::config::{Config, RegistryConfig};
+use crate::config::{Config, RegistryConfig, DEFAULT_AUTH_USERNAME};
 use crate::version::VersionInfo;
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
 use reqwest::{header::HeaderMap, Client as HttpClient, Response, StatusCode};
-use serde::Deserialize;
-use std::sync::LazyLock;
+use std::collections::HashSet;
+use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 use tokio::time::sleep;
 use tracing::{debug, warn};
 
-// Docker Hub silently clamps page_size to 100, so request exactly that.
-const DOCKERHUB_PAGE_SIZE: usize = 100;
-// ghcr.io / lscr.io (and distribution-spec registries) cap `n` at 1000; a larger
-// value is clamped, so 1000 minimises the number of requests (and thus 429s).
+// Registries implementing the distribution spec (Docker Hub, ghcr.io, lscr.io)
+// cap `n` at 1000; a larger value is clamped, so 1000 minimises the number of
+// requests (and thus 429s).
 const OCI_PAGE_SIZE: usize = 1000;
-// Upper bound on tags fetched per image, as a runaway guard only. Tag listings on
-// Docker Hub and ghcr.io/lscr.io are NOT ordered by version (Docker Hub's order is
-// undefined; ghcr.io/lscr.io are chronological), so we must scan the whole list to
-// reliably find the highest version rather than truncate and risk missing it. Real
-// repos (e.g. jellyfin/jellyfin at ~13.6k tags) finish far below this; hitting it
-// means the result may be incomplete and is logged loudly.
+// Upper bound on tags fetched per image, as a runaway guard only. Tag listings are
+// NOT ordered by version (Docker Hub's registry API is lexical, ghcr.io/lscr.io are
+// chronological), so we must scan the whole list to reliably find the highest
+// version rather than truncate and risk missing it. Real repos (e.g.
+// jellyfin/jellyfin at ~13.6k tags) finish far below this; hitting it means the
+// result may be incomplete and is logged loudly.
 const MAX_TAGS_SCANNED: usize = 50_000;
 const MAX_RETRY_ATTEMPTS: u32 = 5;
 const MAX_AUTH_ATTEMPTS: u32 = 2;
@@ -101,17 +100,6 @@ impl std::fmt::Display for ImageRef {
     }
 }
 
-#[derive(Deserialize)]
-struct DockerHubTagsResponse {
-    results: Vec<DockerHubTag>,
-    next: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct DockerHubTag {
-    name: String,
-}
-
 /// A fully-read HTTP response. The body is read inside the retry scope so that a
 /// connection dropped mid-body is retried like any other transport failure;
 /// callers therefore receive the body as an owned string rather than a streaming
@@ -125,6 +113,14 @@ struct FetchResult {
 pub struct Client {
     http_client: HttpClient,
     config: Config,
+    /// Registries whose configured credentials have been rejected, which are from
+    /// then on asked for anonymous tokens only. Re-offering credentials already
+    /// known to be bad costs a full retry budget per image and, on Docker Hub,
+    /// trips the failed-login throttle — whose 429s then delay the anonymous
+    /// request that would have worked. Config is only read at startup, so a
+    /// corrected token needs a restart anyway and this may live as long as the
+    /// client.
+    credentials_rejected: Mutex<HashSet<String>>,
 }
 
 impl Client {
@@ -139,6 +135,7 @@ impl Client {
         Self {
             http_client,
             config,
+            credentials_rejected: Mutex::new(HashSet::new()),
         }
     }
 
@@ -266,28 +263,6 @@ impl Client {
         }
     }
 
-    /// Returns the semver-parseable versions on the page, the URL of the next
-    /// page (if any), and the raw number of tags on the page (including
-    /// non-semver tags, used to budget the total scan).
-    fn parse_dockerhub_response(
-        &self,
-        response_text: &str,
-    ) -> Result<(Vec<VersionInfo>, Option<String>, usize)> {
-        let dockerhub_response: DockerHubTagsResponse = serde_json::from_str(response_text)
-            .map_err(|e| anyhow!("Failed to parse Docker Hub response: {}", e))?;
-
-        let raw_count = dockerhub_response.results.len();
-        let mut versions = Vec::new();
-
-        for tag in dockerhub_response.results {
-            if let Some(version_info) = VersionInfo::from_tag(&tag.name) {
-                versions.push(version_info);
-            }
-        }
-
-        Ok((versions, dockerhub_response.next, raw_count))
-    }
-
     /// Returns the semver-parseable versions on the page, the raw last tag (the
     /// `last=` cursor for the next page, regardless of whether it parsed as
     /// semver), and the raw number of tags on the page.
@@ -318,65 +293,14 @@ impl Client {
         Ok((versions, raw_last_tag, raw_count))
     }
 
+    /// Lists every tag of an image via the registry v2 API, including Docker Hub:
+    /// its hub.docker.com JSON API refuses anonymous requests past a 10,000-tag
+    /// offset ("pagination offset too large for anonymous requests"), which large
+    /// repos such as jellyfin/jellyfin (~13.6k tags) exceed. The v2 endpoint
+    /// paginates by cursor instead of offset, so it has no such ceiling, and its
+    /// 1000-tag pages need ~10x fewer requests.
     pub async fn get_available_versions(&self, image_ref: &ImageRef) -> Result<Vec<VersionInfo>> {
-        if image_ref.registry == "docker.io" {
-            self.get_dockerhub_versions(image_ref).await
-        } else {
-            self.get_registry_v2_versions(image_ref).await
-        }
-    }
-
-    async fn get_dockerhub_versions(&self, image_ref: &ImageRef) -> Result<Vec<VersionInfo>> {
-        let repo_path = self.build_repository_path(image_ref);
-        let mut results = Vec::new();
-        let mut tags_scanned: usize = 0;
-        let mut url = format!(
-            "https://hub.docker.com/v2/repositories/{repo_path}/tags/?page_size={DOCKERHUB_PAGE_SIZE}"
-        );
-
-        loop {
-            debug!("Docker Hub API URL: {}", url);
-
-            let url_clone = url.clone();
-            let fetched = self
-                .fetch_with_retry(
-                    || async { self.http_client.get(&url_clone).send().await },
-                    "Docker Hub API request",
-                )
-                .await?;
-            debug!("Docker Hub response status: {}", fetched.status);
-
-            if !fetched.status.is_success() {
-                return Err(anyhow!(
-                    "Docker Hub request failed with status {}: {}",
-                    fetched.status,
-                    fetched.body
-                ));
-            }
-
-            let (new_tags, next_page, raw_count) = self.parse_dockerhub_response(&fetched.body)?;
-
-            tags_scanned += raw_count;
-            results.extend(new_tags);
-
-            if tags_scanned >= MAX_TAGS_SCANNED {
-                warn!(
-                    "Reached the {}-tag scan limit for {} before exhausting the registry; \
-                     the newest version may have been missed",
-                    MAX_TAGS_SCANNED, image_ref
-                );
-                break;
-            }
-
-            match next_page {
-                // Advance only on a non-empty page with a distinct next link;
-                // stop on the last page, an empty page, or a self-referential link.
-                Some(next) if raw_count > 0 && next != url => url = next,
-                _ => break,
-            }
-        }
-
-        Ok(results)
+        self.get_registry_v2_versions(image_ref).await
     }
 
     async fn get_registry_v2_versions(&self, image_ref: &ImageRef) -> Result<Vec<VersionInfo>> {
@@ -426,47 +350,56 @@ impl Client {
                 )
                 .await?;
 
-            let (new_tags, raw_last_tag, raw_count, link_next) =
-                if fetched.status == reqwest::StatusCode::UNAUTHORIZED {
-                    if auth_attempts >= MAX_AUTH_ATTEMPTS {
-                        return Err(anyhow!(
-                            "Authentication failed after {} attempts for registry {}",
-                            auth_attempts,
-                            image_ref.registry
-                        ));
-                    }
-                    if let Some(token) = &registry_config.auth_token {
-                        if let Some(auth_header) = fetched.headers.get("www-authenticate") {
-                            let auth_str = auth_header.to_str().map_err(|e| {
-                                anyhow!("Invalid WWW-Authenticate header encoding: {}", e)
-                            })?;
-                            bearer_token = self.try_registry_v2_auth(auth_str, token).await?;
-                            auth_attempts += 1;
-                            continue;
-                        } else {
-                            return Err(anyhow!(
-                                "Unauthorized request but no WWW-Authenticate header found"
-                            ));
-                        }
-                    } else {
-                        return Err(anyhow!("Unauthorized request but no auth token configured"));
-                    }
-                } else if fetched.status.is_success() {
-                    let link_next = fetched
-                        .headers
-                        .get("link")
-                        .and_then(|h| h.to_str().ok())
-                        .and_then(|h| self.parse_link_header(h));
-
-                    let (tags, raw_last_tag, raw_count) = self.parse_v2_response(&fetched.body)?;
-                    (tags, raw_last_tag, raw_count, link_next)
-                } else {
+            let (new_tags, raw_last_tag, raw_count, link_next) = if fetched.status
+                == reqwest::StatusCode::UNAUTHORIZED
+            {
+                if auth_attempts >= MAX_AUTH_ATTEMPTS {
                     return Err(anyhow!(
-                        "Registry request failed with status {}: {}",
-                        fetched.status,
-                        fetched.body
+                        "Authentication failed after {} attempts for registry {}",
+                        auth_attempts,
+                        image_ref.registry
+                    ));
+                }
+                let Some(auth_header) = fetched.headers.get("www-authenticate") else {
+                    return Err(anyhow!(
+                        "Unauthorized request but no WWW-Authenticate header found"
                     ));
                 };
+                let auth_str = auth_header
+                    .to_str()
+                    .map_err(|e| anyhow!("Invalid WWW-Authenticate header encoding: {}", e))?;
+                // Answer the challenge even with no token configured: public
+                // repositories on Docker Hub and ghcr.io hand out a pull-scoped
+                // token to unauthenticated callers, and the tag listing is
+                // inaccessible without one.
+                bearer_token = Some(
+                    self.fetch_registry_v2_token(auth_str, &image_ref.registry, registry_config)
+                        .await?,
+                );
+                auth_attempts += 1;
+                continue;
+            } else if fetched.status.is_success() {
+                let link_next = fetched
+                    .headers
+                    .get("link")
+                    .and_then(|h| h.to_str().ok())
+                    .and_then(|h| self.parse_link_header(h));
+
+                // A page came back, so the current token works: give the next
+                // 401 a fresh re-auth budget. Tokens expire (Docker Hub's last
+                // 5 minutes) and a long scan can outlive one, which must not
+                // exhaust the attempt cap and abandon the listing half-read.
+                auth_attempts = 0;
+
+                let (tags, raw_last_tag, raw_count) = self.parse_v2_response(&fetched.body)?;
+                (tags, raw_last_tag, raw_count, link_next)
+            } else {
+                return Err(anyhow!(
+                    "Registry request failed with status {}: {}",
+                    fetched.status,
+                    fetched.body
+                ));
+            };
 
             tags_scanned += raw_count;
             results.extend(new_tags);
@@ -506,7 +439,21 @@ impl Client {
         Ok(results)
     }
 
-    async fn try_registry_v2_auth(&self, auth_str: &str, token: &str) -> Result<Option<String>> {
+    /// Exchanges a `WWW-Authenticate` challenge for a bearer token, using the
+    /// registry's configured credentials when it has any.
+    ///
+    /// A rejected credential falls back to an anonymous token rather than failing
+    /// the image: public repositories hand out pull-scoped tokens to anyone, which
+    /// is all a tag listing needs. Docker Hub is why this matters — it validates
+    /// the basic-auth username, so a `dckr_pat_…` configured without a matching
+    /// `username` is refused outright, and without the fallback every Docker Hub
+    /// image in the run would fail.
+    async fn fetch_registry_v2_token(
+        &self,
+        auth_str: &str,
+        registry: &str,
+        registry_config: &RegistryConfig,
+    ) -> Result<String> {
         let realm = extract_auth_param(auth_str, "realm")?;
         let service = extract_auth_param(auth_str, "service")?;
         let scope = extract_auth_param(auth_str, "scope")?;
@@ -516,18 +463,76 @@ impl Client {
             urlencoding::encode(&service),
             urlencoding::encode(&scope),
         );
-        debug!("Getting registry token from: {}", auth_url);
 
-        let auth_url_clone = auth_url.clone();
-        let token_clone = token.to_string();
+        let credentials = registry_config
+            .auth_token
+            .as_ref()
+            .filter(|_| !self.has_rejected_credentials(registry))
+            .map(|token| {
+                (
+                    registry_config
+                        .username
+                        .as_deref()
+                        .unwrap_or(DEFAULT_AUTH_USERNAME)
+                        .to_string(),
+                    token.clone(),
+                )
+            });
+
+        if credentials.is_none() {
+            return self.request_registry_v2_token(&auth_url, None).await;
+        }
+
+        match self.request_registry_v2_token(&auth_url, credentials).await {
+            Ok(token) => Ok(token),
+            Err(e) => {
+                warn!(
+                    "Credentialed auth for {} failed ({:#}); using anonymous tokens for it \
+                     from now on. Private repositories there will be unreadable until the \
+                     registry's `auth_token` (and, for Docker Hub, `username`) is corrected",
+                    registry, e
+                );
+                self.credentials_rejected
+                    .lock()
+                    .expect("credentials_rejected mutex poisoned")
+                    .insert(registry.to_string());
+                self.request_registry_v2_token(&auth_url, None).await
+            }
+        }
+    }
+
+    fn has_rejected_credentials(&self, registry: &str) -> bool {
+        self.credentials_rejected
+            .lock()
+            .expect("credentials_rejected mutex poisoned")
+            .contains(registry)
+    }
+
+    /// Requests a bearer token from a token endpoint, anonymously when
+    /// `credentials` is `None`.
+    async fn request_registry_v2_token(
+        &self,
+        auth_url: &str,
+        credentials: Option<(String, String)>,
+    ) -> Result<String> {
+        debug!(
+            "Getting {} registry token from: {}",
+            if credentials.is_some() {
+                "authenticated"
+            } else {
+                "anonymous"
+            },
+            auth_url
+        );
+
         let token_response = self
             .fetch_with_retry(
                 || async {
-                    self.http_client
-                        .get(&auth_url_clone)
-                        .basic_auth("token", Some(&token_clone))
-                        .send()
-                        .await
+                    let mut request_builder = self.http_client.get(auth_url);
+                    if let Some((username, token)) = &credentials {
+                        request_builder = request_builder.basic_auth(username, Some(token));
+                    }
+                    request_builder.send().await
                 },
                 "Registry auth token request",
             )
@@ -545,7 +550,7 @@ impl Client {
             .map_err(|e| anyhow!("Failed to parse auth token response: {}", e))?;
 
         if let Some(registry_token) = token_json.get("token").and_then(|t| t.as_str()) {
-            return Ok(Some(registry_token.to_string()));
+            return Ok(registry_token.to_string());
         }
 
         Err(anyhow!("Auth response missing 'token' field"))
@@ -747,19 +752,6 @@ mod tests {
             assert_eq!(raw_last_tag, None);
             assert_eq!(raw_count, 0, "body {body} should yield zero raw tags");
         }
-    }
-
-    #[test]
-    fn test_parse_dockerhub_response_reports_raw_count_and_next() {
-        let client = Client::new(Config::default());
-
-        let body = r#"{"count":3,"next":"https://hub.docker.com/v2/repositories/jellyfin/jellyfin/tags/?page=2&page_size=100","results":[{"name":"10.10.7"},{"name":"latest"},{"name":"10.10.6"}]}"#;
-        let (versions, next, raw_count) = client.parse_dockerhub_response(body).unwrap();
-
-        assert_eq!(raw_count, 3);
-        assert!(next.unwrap().contains("page=2"));
-        let parsed: Vec<_> = versions.iter().map(|v| v.original.as_str()).collect();
-        assert_eq!(parsed, vec!["10.10.7", "10.10.6"]);
     }
 
     #[test]

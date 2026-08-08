@@ -183,6 +183,7 @@ fn test_registry_configuration() {
         RegistryConfig {
             url: "https://simple.registry.com".to_string(),
             auth_token: None,
+            username: None,
         },
     );
     registries.insert(
@@ -190,6 +191,7 @@ fn test_registry_configuration() {
         RegistryConfig {
             url: "https://auth.registry.com".to_string(),
             auth_token: Some("secret-token".to_string()),
+            username: None,
         },
     );
 
@@ -224,7 +226,11 @@ registries: {}
     assert!(config.compose_paths.is_empty());
     assert!(config.ignore_images.is_empty());
     assert!(config.schedule.is_empty());
-    assert!(config.registries.is_empty());
+    // The other fields stay as written, but the default registries are restored:
+    // resolving an image now goes through its registry entry, so an empty map
+    // would make every service fail with "Unknown registry" rather than express
+    // any useful intent.
+    assert!(config.registries.contains_key("docker.io"));
 }
 
 #[test]
@@ -282,4 +288,51 @@ registries:
     assert!(config.registries["private.registry.com"]
         .auth_token
         .is_none());
+}
+
+#[test]
+fn test_load_restores_default_registries_omitted_by_the_config_file() {
+    // A `registries` block replaces the defaults instead of merging, so a file
+    // listing only a private registry must still be able to resolve Docker Hub:
+    // every `nginx:1.2.3`-style image in the compose files depends on it.
+    let yaml_config = r#"
+compose_paths: []
+schedule: "0 0 2 * * *"
+registries:
+  private.registry.com:
+    url: "https://private.registry.com"
+"#;
+
+    let mut temp_file = NamedTempFile::new().unwrap();
+    temp_file.write_all(yaml_config.as_bytes()).unwrap();
+    temp_file.flush().unwrap();
+
+    let config = Config::load(temp_file.path().to_path_buf()).unwrap();
+    assert_eq!(
+        config.registries["docker.io"].url,
+        "https://registry-1.docker.io"
+    );
+    assert!(config.registries.contains_key("private.registry.com"));
+}
+
+#[test]
+fn test_load_keeps_explicit_registry_overrides() {
+    let yaml_config = r#"
+compose_paths: []
+schedule: "0 0 2 * * *"
+registries:
+  docker.io:
+    url: "https://mirror.internal"
+    username: "andras"
+    auth_token: "secret"
+"#;
+
+    let mut temp_file = NamedTempFile::new().unwrap();
+    temp_file.write_all(yaml_config.as_bytes()).unwrap();
+    temp_file.flush().unwrap();
+
+    let config = Config::load(temp_file.path().to_path_buf()).unwrap();
+    let docker_io = &config.registries["docker.io"];
+    assert_eq!(docker_io.url, "https://mirror.internal");
+    assert_eq!(docker_io.username.as_deref(), Some("andras"));
 }

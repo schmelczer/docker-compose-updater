@@ -12,16 +12,26 @@ compose_paths:
 schedule: "0 0 2 * * *"
 
 # Registry configurations
-# All registries use the standard Docker Registry v2 API
+# All registries use the standard Docker Registry v2 API. Public repositories need
+# no credentials: the updater requests an anonymous pull token when challenged.
+# Defaults for docker.io and ghcr.io are filled in for any entry left out here.
 registries:
   "docker.io":
     url: "https://registry-1.docker.io"
-    # Docker Hub uses the standard registry API endpoint
+    # Docker Hub validates the basic-auth username, so a personal access token
+    # only works alongside the account that owns it. Both are optional; without
+    # them public images are still read anonymously.
+    # username: "your-docker-hub-username"
+    # auth_token: "${DOCKERHUB_TOKEN}"
 
   "ghcr.io":
     url: "https://ghcr.io"
     auth_token: "${GITHUB_TOKEN}"
     # GitHub token must have 'read:packages' scope and access to the target repositories
+    # `username` is not needed here: the token itself carries the identity
+
+  "lscr.io":
+    url: "https://lscr.io"
 
   "registry.gitlab.com":
     url: "https://registry.gitlab.com"
@@ -37,10 +47,6 @@ registries:
 update_strategy: "LatestPatchOfPreviousMinor"
 
 # Images to ignore (substring matching)
-ignore_images:
-  - "localhost"
-  - "127.0.0.1"
-  - "local/"
+ignore_images: []
 
-# Dry run mode - if true, no files will be modified
 dry_run: false

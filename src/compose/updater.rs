@@ -296,10 +296,27 @@ fn choose_new_tag(
     strategy: &UpdateStrategy,
 ) -> Option<String> {
     let selector = create_selector(strategy);
-    let target =
-        selector.select_target_version(available_versions, current_prefix, current_suffix)?;
+    // Warn here rather than inside the selector: this is the innermost scope that
+    // knows *which* image was skipped, and a bare "no matching versions" line is
+    // undiagnosable in a run covering dozens of services.
+    let Some(target) = selector.select_target_version(
+        available_versions,
+        current_prefix.clone(),
+        current_suffix.clone(),
+    ) else {
+        warn!(
+            "No {:?} candidate for {} (prefix {:?}, suffix {:?}) among {} parseable registry tags",
+            strategy,
+            image_ref,
+            current_prefix,
+            current_suffix,
+            available_versions.len()
+        );
+        return None;
+    };
 
     if target.version <= *current_version {
+        debug!("{} is already at or above the target {}", image_ref, target);
         return None;
     }
 
