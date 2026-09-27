@@ -14,6 +14,7 @@ fn test_config_default_values() {
         UpdateStrategy::LatestPatchOfPreviousMinor
     );
     assert!(!config.dry_run);
+    assert_eq!(config.registry_request_interval_ms, 1000);
     assert!(config.ignore_images.is_empty());
     assert!(!config.compose_paths.is_empty());
 
@@ -37,6 +38,7 @@ compose_paths:
 schedule: "0 0 3 * * *"
 update_strategy: "Latest"
 dry_run: true
+registry_request_interval_ms: 1500
 ignore_images:
   - "localhost"
   - "127.0.0.1"
@@ -57,6 +59,7 @@ registries:
     assert_eq!(config.schedule, "0 0 3 * * *");
     assert_eq!(config.update_strategy, UpdateStrategy::Latest);
     assert!(config.dry_run);
+    assert_eq!(config.registry_request_interval_ms, 1500);
     assert_eq!(config.ignore_images.len(), 2);
     assert!(config.registries.contains_key("custom.registry.com"));
 

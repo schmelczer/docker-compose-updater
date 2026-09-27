@@ -153,6 +153,7 @@ mod tests {
             update_strategy: UpdateStrategy::LatestPatchOfPreviousMinor,
             ignore_images: vec![],
             dry_run: true,
+            ..Config::default()
         }
     }
 

@@ -3,10 +3,10 @@ use crate::version::VersionInfo;
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
 use reqwest::{header::HeaderMap, Client as HttpClient, Response, StatusCode};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
-use tokio::time::sleep;
+use tokio::time::{sleep, sleep_until, Instant};
 use tracing::{debug, warn};
 
 // Registries implementing the distribution spec (Docker Hub, ghcr.io, lscr.io)
@@ -23,6 +23,7 @@ const MAX_TAGS_SCANNED: usize = 50_000;
 const MAX_RETRY_ATTEMPTS: u32 = 5;
 const MAX_AUTH_ATTEMPTS: u32 = 2;
 const INITIAL_RETRY_DELAY_SECS: u64 = 1;
+const INITIAL_RATE_LIMIT_DELAY_SECS: u64 = 5;
 const HTTP_TIMEOUT_SECS: u64 = 30;
 const HTTP_CONNECT_TIMEOUT_SECS: u64 = 10;
 // Evict idle keep-alive connections well before registries (Docker Hub, GHCR,
@@ -121,6 +122,9 @@ pub struct Client {
     /// corrected token needs a restart anyway and this may live as long as the
     /// client.
     credentials_rejected: Mutex<HashSet<String>>,
+    /// Shared across pages and images so a successful request does not reset
+    /// pacing, and exhausting one image's retries does not bypass a cooldown.
+    next_request_at: Mutex<HashMap<String, Instant>>,
 }
 
 impl Client {
@@ -136,7 +140,32 @@ impl Client {
             http_client,
             config,
             credentials_rejected: Mutex::new(HashSet::new()),
+            next_request_at: Mutex::new(HashMap::new()),
         }
+    }
+
+    async fn wait_for_request_slot(&self, backend: &str) {
+        loop {
+            let deadline = {
+                let mut next_requests = self.next_request_at.lock().unwrap();
+                let now = Instant::now();
+                let next = next_requests.entry(backend.to_string()).or_insert(now);
+                if *next <= now {
+                    *next = now + Duration::from_millis(self.config.registry_request_interval_ms);
+                    return;
+                }
+                *next
+            };
+            sleep_until(deadline).await;
+            // Recheck in case another request extended the cooldown.
+        }
+    }
+
+    fn defer_requests(&self, backend: &str, delay: Duration) {
+        let deadline = Instant::now() + delay;
+        let mut next_requests = self.next_request_at.lock().unwrap();
+        let next = next_requests.entry(backend.to_string()).or_insert(deadline);
+        *next = (*next).max(deadline);
     }
 
     fn parse_retry_after(&self, retry_after: &str) -> Option<Duration> {
@@ -159,6 +188,7 @@ impl Client {
         &self,
         request_fn: F,
         operation_name: &str,
+        request_url: &str,
     ) -> Result<FetchResult>
     where
         F: Fn() -> Fut,
@@ -166,8 +196,12 @@ impl Client {
     {
         let mut attempt = 0;
         let mut delay = Duration::from_secs(INITIAL_RETRY_DELAY_SECS);
+        let mut rate_limit_delay = Duration::from_secs(INITIAL_RATE_LIMIT_DELAY_SECS);
+        let backend = registry_backend(request_url)?;
+        let operation_name = format!("{operation_name} [{backend}]");
 
         loop {
+            self.wait_for_request_slot(&backend).await;
             // Send the request AND read the body as one retryable unit: a
             // connection dropped while streaming the body (`is_body`) is just as
             // transient as one dropped while sending the request (`is_request`),
@@ -214,32 +248,33 @@ impl Client {
             if fetched.status == StatusCode::TOO_MANY_REQUESTS {
                 attempt += 1;
 
-                if attempt > MAX_RETRY_ATTEMPTS {
-                    return Err(anyhow!(
-                        "{} failed: Rate limited (429) after {} attempts",
-                        operation_name,
-                        MAX_RETRY_ATTEMPTS
-                    ));
-                }
-
                 let wait_duration = if let Some(retry_after) = fetched
                     .headers
                     .get("retry-after")
                     .and_then(|h| h.to_str().ok())
                 {
-                    self.parse_retry_after(retry_after).unwrap_or(delay)
+                    self.parse_retry_after(retry_after)
+                        .unwrap_or(rate_limit_delay)
                 } else {
-                    delay
+                    rate_limit_delay
                 };
 
+                self.defer_requests(&backend, wait_duration);
+                if attempt > MAX_RETRY_ATTEMPTS {
+                    return Err(anyhow!(
+                        "{} failed: Rate limited (429) after {} retries; backend cooldown {:?}",
+                        operation_name,
+                        MAX_RETRY_ATTEMPTS,
+                        wait_duration
+                    ));
+                }
+
                 warn!(
-                    "{} rate limited (429), attempt {}/{}, waiting {:?} before retry",
+                    "{} rate limited (429), retry {}/{}, waiting {:?} before retry",
                     operation_name, attempt, MAX_RETRY_ATTEMPTS, wait_duration
                 );
 
-                sleep(wait_duration).await;
-
-                delay = delay.saturating_mul(2);
+                rate_limit_delay = rate_limit_delay.saturating_mul(2);
             } else {
                 return Ok(fetched);
             }
@@ -346,7 +381,8 @@ impl Client {
                         }
                         request_builder.send().await
                     },
-                    "Registry v2 API request",
+                    &format!("Registry v2 tag listing for {image_ref}"),
+                    &url,
                 )
                 .await?;
 
@@ -535,6 +571,7 @@ impl Client {
                     request_builder.send().await
                 },
                 "Registry auth token request",
+                auth_url,
             )
             .await?;
 
@@ -576,6 +613,20 @@ impl Client {
     }
 }
 
+/// LinuxServer's gateway and GHCR serve the same image backend. Keep their
+/// request budget together even when compose files use both image prefixes.
+fn registry_backend(request_url: &str) -> Result<String> {
+    let url = reqwest::Url::parse(request_url)?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow!("Registry URL has no host"))?;
+    let host = if host == "lscr.io" { "ghcr.io" } else { host };
+    Ok(match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    })
+}
+
 static AUTH_PARAM_REGEX: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r#"(\w+)="([^"]+)""#).unwrap());
 
@@ -607,6 +658,172 @@ fn extract_auth_param(auth_str: &str, param: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    fn response(status: &str, headers: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n{headers}\r\n{body}",
+            body.len()
+        )
+    }
+
+    async fn mock_registry(
+        responses: Vec<String>,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for response in responses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buf = [0; 1024];
+                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let len = stream.read(&mut buf).await.unwrap();
+                    assert_ne!(len, 0, "connection closed before request headers");
+                    request.extend_from_slice(&buf[..len]);
+                }
+                requests.push(String::from_utf8(request).unwrap());
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+            requests
+        });
+        (url, server)
+    }
+
+    fn client_for_mock(url: &str, interval_ms: u64) -> Client {
+        let mut config = Config {
+            registry_request_interval_ms: interval_ms,
+            ..Config::default()
+        };
+        config.registries.insert(
+            "test.registry".to_string(),
+            RegistryConfig {
+                url: url.to_string(),
+                auth_token: None,
+                username: None,
+            },
+        );
+        Client::new(config)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_backend_pacing_shares_lscr_budget_and_isolates_other_registries() {
+        let client = Client::new(Config::default());
+        let lscr = registry_backend("https://lscr.io/v2/linuxserver/prowlarr/tags/list").unwrap();
+        let ghcr = registry_backend("https://ghcr.io/token?scope=repository:x:pull").unwrap();
+        let docker =
+            registry_backend("https://registry-1.docker.io/v2/library/nginx/tags/list").unwrap();
+        let start = Instant::now();
+        client.wait_for_request_slot(&lscr).await;
+        client.wait_for_request_slot(&docker).await;
+        assert_eq!(start.elapsed(), Duration::ZERO);
+        client.wait_for_request_slot(&ghcr).await;
+        assert_eq!(start.elapsed(), Duration::from_secs(1));
+        client.wait_for_request_slot(&lscr).await;
+        assert_eq!(start.elapsed(), Duration::from_secs(2));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_cooldown_survives_disabled_pacing_and_cannot_be_shortened() {
+        let client = client_for_mock("http://localhost", 0);
+        let start = Instant::now();
+        client.defer_requests("ghcr.io", Duration::from_secs(40));
+        client.defer_requests("ghcr.io", Duration::from_secs(5));
+        client.wait_for_request_slot("docker.io").await;
+        assert_eq!(start.elapsed(), Duration::ZERO);
+        client.wait_for_request_slot("ghcr.io").await;
+        assert_eq!(start.elapsed(), Duration::from_secs(40));
+        client.wait_for_request_slot("ghcr.io").await;
+        assert_eq!(start.elapsed(), Duration::from_secs(40));
+    }
+
+    #[tokio::test]
+    async fn test_pacing_covers_authentication_and_tag_pages() {
+        let (url, server) = mock_registry(vec![
+            response("200 OK", "", r#"{"token":"test-token"}"#),
+            response(
+                "200 OK",
+                "Link: </v2/org/app/tags/list?n=1000&last=1.0.0>; rel=\"next\"\r\n",
+                r#"{"tags":["1.0.0"]}"#,
+            ),
+            response("200 OK", "", r#"{"tags":["1.0.1"]}"#),
+            response("200 OK", "", r#"{"tags":[]}"#),
+        ])
+        .await;
+        let client = client_for_mock(&url, 100);
+        let start = Instant::now();
+        client
+            .request_registry_v2_token(&format!("{url}/token"), None)
+            .await
+            .unwrap();
+        let image = ImageRef::parse("test.registry/org/app:1.0.0").unwrap();
+        let versions = client.get_available_versions(&image).await.unwrap();
+        let tags: Vec<_> = versions.iter().map(|v| v.original.as_str()).collect();
+        assert_eq!(tags, vec!["1.0.0", "1.0.1"]);
+        assert!(start.elapsed() >= Duration::from_millis(300));
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 4);
+        assert!(requests[0].starts_with("GET /token "));
+        assert!(requests[2].contains("last=1.0.0"));
+    }
+
+    #[tokio::test]
+    async fn test_exhausted_retries_preserve_cooldown_for_next_image() {
+        let mut responses = vec![
+            response("429 Too Many Requests", "Retry-After: 0\r\n", "{}");
+            MAX_RETRY_ATTEMPTS as usize
+        ];
+        responses.push(response(
+            "429 Too Many Requests",
+            "Retry-After: 1\r\n",
+            "{}",
+        ));
+        responses.push(response("200 OK", "", r#"{"tags":[]}"#));
+        let (url, server) = mock_registry(responses).await;
+        let client = client_for_mock(&url, 0);
+        let image = ImageRef::parse("test.registry/org/app:1.0.0").unwrap();
+        let error = client.get_available_versions(&image).await.unwrap_err();
+        let error = error.to_string();
+        assert!(error.contains("test.registry/org/app:1.0.0"), "{error}");
+        assert!(error.contains("after 5 retries"), "{error}");
+        assert!(error.contains("backend cooldown 1s"), "{error}");
+        let next_image = ImageRef::parse("test.registry/org/other:2.0.0").unwrap();
+        let start = Instant::now();
+        client.get_available_versions(&next_image).await.unwrap();
+        assert!(start.elapsed() >= Duration::from_millis(950));
+        assert_eq!(server.await.unwrap().len(), 7);
+    }
+
+    #[tokio::test]
+    async fn test_rate_limit_without_retry_after_waits_before_retrying() {
+        let (url, server) = mock_registry(vec![
+            response("429 Too Many Requests", "", "{}"),
+            response("200 OK", "", r#"{"tags":[]}"#),
+        ])
+        .await;
+        let client = client_for_mock(&url, 0);
+        let image = ImageRef::parse("test.registry/org/app:1.0.0").unwrap();
+        let start = Instant::now();
+        client.get_available_versions(&image).await.unwrap();
+        assert!(start.elapsed() >= Duration::from_secs(INITIAL_RATE_LIMIT_DELAY_SECS));
+        assert_eq!(server.await.unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_retry_after_accepts_seconds_and_http_dates() {
+        let client = Client::new(Config::default());
+        assert_eq!(
+            client.parse_retry_after("45"),
+            Some(Duration::from_secs(45))
+        );
+        assert_eq!(client.parse_retry_after("0"), Some(Duration::ZERO));
+        assert_eq!(client.parse_retry_after("invalid"), None);
+        let date = (Utc::now() + chrono::Duration::seconds(60)).to_rfc2822();
+        let delay = client.parse_retry_after(&date).unwrap();
+        assert!(delay >= Duration::from_secs(58) && delay <= Duration::from_secs(60));
+    }
 
     #[test]
     fn test_image_ref_parsing() {

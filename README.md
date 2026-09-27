@@ -93,6 +93,20 @@ cargo build --release
 ./target/release/docker-compose-updater --config ./config.yaml start
 ```
 
+### Registry rate limits
+
+Version checks list all image tags, so repositories with thousands of build and
+architecture tags require many requests even when checking only one service.
+The updater spaces requests to each registry backend one second apart by
+default. LinuxServer's `lscr.io` gateway shares the `ghcr.io` request budget.
+
+Set `registry_request_interval_ms: 2000` in `config.yaml` to slow requests further
+if other tools share the registry quota. The setting applies to tag pages,
+authentication and retries; `0` disables pacing. An HTTP 429 pauses requests to
+that backend using `Retry-After`, or exponential waits of 5, 10, 20, 40 and 80
+seconds when the header is absent or invalid. Cooldowns also apply to subsequent
+images if retries are exhausted. Warnings include the image and backend.
+
 ## Update Strategies
 
 The service supports three intelligent update strategies, defaulting to the most conservative:

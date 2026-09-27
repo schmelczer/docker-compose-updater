@@ -507,5 +507,6 @@ fn create_test_config() -> Config {
         update_strategy: UpdateStrategy::Latest,
         ignore_images: vec![],
         dry_run: true,
+        ..Config::default()
     }
 }

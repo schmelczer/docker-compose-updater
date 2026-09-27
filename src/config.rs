@@ -18,6 +18,9 @@ pub struct Config {
     pub update_strategy: UpdateStrategy,
     pub ignore_images: Vec<String>,
     pub dry_run: bool,
+    /// Minimum time between requests to the same registry backend, including
+    /// pagination, authentication and retries. lscr.io shares GHCR's budget.
+    pub registry_request_interval_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,6 +72,7 @@ impl Default for Config {
             update_strategy: UpdateStrategy::LatestPatchOfPreviousMinor,
             ignore_images: vec![],
             dry_run: false,
+            registry_request_interval_ms: 1000,
         }
     }
 }

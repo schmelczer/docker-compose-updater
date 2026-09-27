@@ -26,6 +26,7 @@ services:
         update_strategy: UpdateStrategy::Latest,
         ignore_images: vec![],
         dry_run: true,
+        ..Config::default()
     };
 
     let updater = ComposeUpdater::new(config);

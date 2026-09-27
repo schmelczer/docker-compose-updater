@@ -25,6 +25,7 @@ fn test_scheduler_invalid_cron_expressions() {
             update_strategy: UpdateStrategy::Latest,
             ignore_images: vec![],
             dry_run: true,
+            ..Config::default()
         };
 
         assert!(
@@ -52,6 +53,7 @@ fn test_scheduler_valid_cron_expressions() {
             update_strategy: UpdateStrategy::Latest,
             ignore_images: vec![],
             dry_run: true,
+            ..Config::default()
         };
 
         assert!(
@@ -139,6 +141,7 @@ fn test_registry_unknown_registry() {
         update_strategy: UpdateStrategy::Latest,
         ignore_images: vec![],
         dry_run: true,
+        ..Config::default()
     };
 
     let registry_client = RegistryClient::new(config);
@@ -199,6 +202,7 @@ async fn test_update_continues_after_service_failure() {
         update_strategy: UpdateStrategy::Latest,
         ignore_images: vec![],
         dry_run: true,
+        ..Config::default()
     };
 
     let updater = ComposeUpdater::new(config);
@@ -233,6 +237,7 @@ async fn test_scheduler_reports_failure_on_service_error() {
         update_strategy: UpdateStrategy::Latest,
         ignore_images: vec![],
         dry_run: true,
+        ..Config::default()
     };
 
     let scheduler = Scheduler::new(config, None).unwrap();
@@ -251,6 +256,7 @@ fn test_config_edge_cases() {
         update_strategy: UpdateStrategy::Latest,
         ignore_images: vec![],
         dry_run: true,
+        ..Config::default()
     };
 
     assert!(Scheduler::new(minimal_config.clone(), None).is_ok());
@@ -299,5 +305,6 @@ fn create_test_config() -> Config {
         update_strategy: UpdateStrategy::Latest,
         ignore_images: vec![],
         dry_run: true,
+        ..Config::default()
     }
 }

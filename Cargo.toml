@@ -24,6 +24,7 @@ chrono = "0.4"
 
 [dev-dependencies]
 tempfile = "3.0"
+tokio = { version = "1.0", features = ["test-util"] }
 
 [lib]
 name = "docker_compose_updater"

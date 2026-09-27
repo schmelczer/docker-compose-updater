@@ -196,6 +196,7 @@ async fn test_ghcr_authentication_e2e() {
         update_strategy: UpdateStrategy::LatestPatchOfPreviousMinor,
         ignore_images: vec!["localhost".to_string()],
         dry_run: true,
+        ..Config::default()
     };
 
     let client = Client::new(config);
@@ -227,5 +228,6 @@ fn create_test_config() -> Config {
         update_strategy: UpdateStrategy::LatestPatchOfPreviousMinor,
         ignore_images: vec!["localhost".to_string()],
         dry_run: true,
+        ..Config::default()
     }
 }

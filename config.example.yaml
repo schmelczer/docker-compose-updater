@@ -11,6 +11,11 @@ compose_paths:
 # Default: Daily at 2 AM UTC
 schedule: "0 0 2 * * *"
 
+# Space requests to each registry backend, including tag pages and retries.
+# lscr.io and ghcr.io share a budget. Increase this if other tools on the same
+# server also query GHCR heavily. Set to 0 to disable pacing (not cooldowns).
+registry_request_interval_ms: 1000
+
 # Registry configurations
 # All registries use the standard Docker Registry v2 API. Public repositories need
 # no credentials: the updater requests an anonymous pull token when challenged.
