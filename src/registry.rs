@@ -345,6 +345,7 @@ impl Client {
         let mut results = Vec::new();
         let mut last_tag: Option<String> = None;
         let mut next_url: Option<String> = None;
+        let mut uses_link_pagination = false;
         let mut bearer_token: Option<String> = None;
         let mut auth_attempts: u32 = 0;
         let mut tags_scanned: usize = 0;
@@ -449,9 +450,10 @@ impl Client {
                 break;
             }
 
-            // Advance via the registry's Link header when present, else the raw
-            // last-tag cursor. Stop on an empty page, a Link header that points
-            // back at the current page, or a cursor that did not move.
+            // Prefer the registry's continuation URL: its cursor may be opaque
+            // (ECR), rather than a tag. Once Link pagination ends, do not invent
+            // another cursor. Legacy registries without Link headers need a
+            // last-tag cursor only when the requested page was full.
             if let Some(next) = link_next {
                 let resolved = if next.starts_with("http://") || next.starts_with("https://") {
                     next
@@ -461,9 +463,12 @@ impl Client {
                 if resolved == url {
                     break;
                 }
+                uses_link_pagination = true;
                 next_url = Some(resolved);
+            } else if uses_link_pagination || raw_count < OCI_PAGE_SIZE {
+                break;
             } else if let Some(last) = raw_last_tag {
-                if raw_count == 0 || last_tag.as_ref() == Some(&last) {
+                if last_tag.as_ref() == Some(&last) {
                     break;
                 }
                 last_tag = Some(last);
@@ -749,7 +754,6 @@ mod tests {
                 r#"{"tags":["1.0.0"]}"#,
             ),
             response("200 OK", "", r#"{"tags":["1.0.1"]}"#),
-            response("200 OK", "", r#"{"tags":[]}"#),
         ])
         .await;
         let client = client_for_mock(&url, 100);
@@ -762,11 +766,70 @@ mod tests {
         let versions = client.get_available_versions(&image).await.unwrap();
         let tags: Vec<_> = versions.iter().map(|v| v.original.as_str()).collect();
         assert_eq!(tags, vec!["1.0.0", "1.0.1"]);
-        assert!(start.elapsed() >= Duration::from_millis(300));
+        assert!(start.elapsed() >= Duration::from_millis(200));
         let requests = server.await.unwrap();
-        assert_eq!(requests.len(), 4);
+        assert_eq!(requests.len(), 3);
         assert!(requests[0].starts_with("GET /token "));
         assert!(requests[2].contains("last=1.0.0"));
+    }
+
+    #[tokio::test]
+    async fn test_short_tag_page_without_link_is_terminal() {
+        let (url, server) = mock_registry(vec![response(
+            "200 OK",
+            "",
+            r#"{"tags":["1.0.0","1.0.1"]}"#,
+        )])
+        .await;
+        let client = client_for_mock(&url, 0);
+        let image = ImageRef::parse("test.registry/org/app:1.0.0").unwrap();
+        let versions = client.get_available_versions(&image).await.unwrap();
+        assert_eq!(versions.len(), 2);
+        assert_eq!(server.await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_opaque_link_cursor_stops_when_link_is_absent() {
+        let full_page: Vec<_> = (0..OCI_PAGE_SIZE).map(|i| format!("2.0.{i}")).collect();
+        let body = serde_json::json!({"tags": full_page}).to_string();
+        let (url, server) = mock_registry(vec![
+            response(
+                "200 OK",
+                "Link: </v2/org/app/tags/list?n=1000&last=opaque%2Bcursor%3D>; rel=\"next\"\r\n",
+                r#"{"tags":["1.0.0"]}"#,
+            ),
+            response("200 OK", "", &body),
+        ])
+        .await;
+        let client = client_for_mock(&url, 0);
+        let image = ImageRef::parse("test.registry/org/app:1.0.0").unwrap();
+        let versions = client.get_available_versions(&image).await.unwrap();
+        assert_eq!(versions.len(), OCI_PAGE_SIZE + 1);
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[1].starts_with("GET /v2/org/app/tags/list?n=1000&last=opaque%2Bcursor%3D ")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_full_legacy_page_uses_last_raw_tag_as_cursor() {
+        let mut full_page: Vec<_> = (0..OCI_PAGE_SIZE - 1).map(|i| format!("1.0.{i}")).collect();
+        full_page.push("nightly".to_string());
+        let body = serde_json::json!({"tags": full_page}).to_string();
+        let (url, server) = mock_registry(vec![
+            response("200 OK", "", &body),
+            response("200 OK", "", r#"{"tags":["2.0.0"]}"#),
+        ])
+        .await;
+        let client = client_for_mock(&url, 0);
+        let image = ImageRef::parse("test.registry/org/app:1.0.0").unwrap();
+        let versions = client.get_available_versions(&image).await.unwrap();
+        assert_eq!(versions.len(), OCI_PAGE_SIZE);
+        assert_eq!(versions.last().unwrap().original, "2.0.0");
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].contains("&last=nightly "));
     }
 
     #[tokio::test]
