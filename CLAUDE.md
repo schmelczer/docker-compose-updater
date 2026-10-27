@@ -58,7 +58,7 @@ This is a Rust-based Docker Compose updater service that automatically updates i
 
 - **Configuration-driven**: All behavior controlled through `config.yaml` including paths, schedules, registries, and update strategies.
 - **Preserves formatting**: Uses line-by-line regex parsing rather than full YAML parsing to maintain comments and formatting.
-- **Flexible update strategies**: Supports different version update approaches (latest patch of previous minor, latest patch, latest minor, latest).
+- **Flexible update strategies**: Supports `LatestPatchOfPreviousMinor` (the highest patch of the newest available release line below the latest published line) and `Latest`. Both only apply targets newer than the current version.
 - **Registry abstraction**: Generic registry client that works with multiple container registries.
 - **Health monitoring**: Built-in health server for monitoring service status.
 

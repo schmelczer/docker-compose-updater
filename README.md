@@ -64,8 +64,6 @@ services:
       - GITHUB_TOKEN=${GITHUB_TOKEN}
       - RUST_LOG=info
     volumes:
-      # Mount Docker socket (read-only for security)
-      - /var/run/docker.sock:/var/run/docker.sock:ro
       # Mount compose files directory
       - ./compose-files:/app/compose-files:rw
       # Mount configuration
@@ -109,18 +107,42 @@ images if retries are exhausted. Warnings include the image and backend.
 
 ## Update Strategies
 
-The service supports three intelligent update strategies, defaulting to the most conservative:
+The service supports two update strategies, defaulting to `LatestPatchOfPreviousMinor`.
 
+Both strategies consider only parseable registry tags with the same prefix and
+suffix as the current tag. A selected target is applied only when its version is
+strictly greater than the current version. Equal or older targets leave the
+Compose file unchanged, so neither strategy downgrades an image.
 
 ### `LatestPatchOfPreviousMinor`
-- **Predictable**: Always updates to the latest patch of the previous minor version
-- **Consistent Behaviour**: Never updates to the current latest minor
-- **Example**: `1.5.3` → `1.4.8`
+
+Selects the highest patch in the newest available release line below the latest
+published line. A release line is a `(major, minor)` pair. Selection uses the
+available registry versions; it does not subtract one from the installed minor
+version. It can skip missing minor lines or cross a major-version gap. If there
+is no older matching release line, no target is selected.
+
+The following examples use illustrative registry tag sets:
+
+| Current tag | Available matching registry tags | Selected target | Result |
+| --- | --- | --- | --- |
+| `1.3.2` | `1.3.2`, `1.4.7`, `1.4.8`, `1.5.3` | `1.4.8` | Update to `1.4.8` |
+| `1.4.8` | `1.3.2`, `1.4.7`, `1.4.8`, `1.5.3` | `1.4.8` | Unchanged: equal version |
+| `1.5.3` | `1.3.2`, `1.4.7`, `1.4.8`, `1.5.3` | `1.4.8` | Unchanged: downgrade prevented |
+| `2.1.0` | `2.1.0`, `2.3.5`, `2.5.2` | `2.3.5` | Update to `2.3.5`, skipping the missing `2.4` line |
+| `4.0.15` | `4.0.15`, `4.0.19`, `5.14` | `4.0.19` | Update to `4.0.19` across the gap below `5.14` |
+| `1.5.1` | `1.5.1`, `1.5.3` | None | Unchanged: only one release line available |
 
 ### `Latest`
-- **Aggressive**: Updates to the absolute latest available version
-- **Cutting Edge**: Useful for development environments
-- **Example**: `1.5.3` → `2.1.0`
+
+Selects the highest available matching version, including major-version updates.
+The same no-downgrade guard applies:
+
+| Current tag | Available matching registry tags | Selected target | Result |
+| --- | --- | --- | --- |
+| `1.5.3` | `1.4.8`, `1.5.3`, `2.1.0` | `2.1.0` | Update to `2.1.0` |
+| `2.1.0` | `1.4.8`, `1.5.3`, `2.1.0` | `2.1.0` | Unchanged: equal version |
+| `2.1.0` | `1.4.8`, `1.5.3` | `1.5.3` | Unchanged: downgrade prevented |
 
 ## Advanced Version Handling
 
@@ -171,29 +193,31 @@ registries:
 
 ## Supported Image Formats
 
-The updater handles various image naming conventions:
+The updater handles various image naming conventions. These examples show image
+references; update targets depend on the strategy and available registry tags as
+described above.
 
-```yaml
+```text
 # Standard Docker Hub images
-nginx:1.21.0 → nginx:1.20.6
-ubuntu:20.04 → ubuntu:18.04
+nginx:1.21.0
+ubuntu:24.10
 
 # Namespaced images
-bitnami/nginx:1.21.0 → bitnami/nginx:1.20.6
-library/postgres:13.7 → library/postgres:12.11
+bitnami/nginx:1.21.0
+library/postgres:13.7
 
 # Custom registries
-ghcr.io/user/app:v1.0.0 → ghcr.io/user/app:v0.9.5
-registry.example.com/team/service:2.1.3 → registry.example.com/team/service:2.0.9
+ghcr.io/user/app:v1.0.0
+registry.example.com/team/service:2.1.3
 
 # Complex versioning
-nginx:1.21.0-alpine → nginx:1.20.6-alpine
-postgres:13.7-bullseye → postgres:12.11-bullseye
-redis:v7.0.0-alpine3.16 → redis:v6.2.7-alpine3.16
+nginx:1.21.0-alpine
+postgres:13.7-bullseye
+redis:v7.0.0-alpine3.16
 
-# Local development (typically ignored)
-localhost:5000/myapp:latest → [ignored by default]
-127.0.0.1:8080/service:dev → [ignored by default]
+# Local development (ignored by the Quick Start ignore_images configuration)
+localhost:5000/myapp:latest
+127.0.0.1:8080/service:dev
 ```
 
 ## Health Monitoring & Observability
@@ -226,10 +250,21 @@ The service reports:
 
 - **Non-Root Execution**: Designed to run as non-root user in containers
 - **Minimal Attack Surface**: Alpine Linux base image with minimal packages
-- **Read-Only Docker Socket**: Only requires read access to Docker socket
+- **No Docker Daemon Access Required**: Queries registries and edits Compose files without a Docker socket mount
 - **Secret Management**: All tokens provided via environment variables
 - **Input Validation**: Comprehensive validation of all configuration inputs
 - **Error Sanitisation**: No sensitive information leaked in error messages
+
+Mount only the Compose files to update and the configuration file. The updater
+does not use the Docker daemon or restart running containers.
+
+A `:ro` bind mount restricts filesystem changes to the socket path; it does not
+make Docker API requests read-only. A process that can connect to the socket can
+still send mutating requests. Docker daemon access can grant root authority on
+the host; see [Docker's socket access guidance](https://docs.docker.com/engine/security/protect-access/).
+If a future feature needs daemon access, enforce an API authorization boundary,
+such as a [Docker authorization plugin](https://docs.docker.com/engine/extend/plugins_authorization/),
+with an explicit policy limiting permitted requests.
 
 ## Development
 
