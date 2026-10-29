@@ -17,10 +17,10 @@ jobs:
   test:
     runs-on: docker
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Cache Rust dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/bin/
@@ -51,7 +51,7 @@ jobs:
     needs: test
     runs-on: docker
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Build and publish image
         uses: http://forgejo:3000/andras/ci-actions/docker-publish@main

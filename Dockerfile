@@ -1,4 +1,4 @@
-FROM public.ecr.aws/docker/library/rust:1.85.1-alpine AS builder
+FROM public.ecr.aws/docker/library/rust:1.99.1-alpine AS builder
 
 RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static
 
@@ -9,7 +9,7 @@ COPY src ./src
 
 RUN cargo build --release
 
-FROM public.ecr.aws/docker/library/alpine:3.21.8
+FROM public.ecr.aws/docker/library/alpine:3.24.3
 
 RUN apk add --no-cache ca-certificates tzdata curl
 
