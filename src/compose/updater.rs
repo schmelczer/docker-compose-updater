@@ -3,7 +3,7 @@ use crate::config::{Config, UpdateStrategy};
 use crate::registry::{Client as RegistryClient, ImageRef};
 use crate::strategy::create_selector;
 use crate::version::{parse_version_tag, VersionInfo};
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, ensure, Context, Result};
 use regex::Regex;
 use semver::Version;
 use std::collections::HashSet;
@@ -134,16 +134,30 @@ impl ComposeUpdater {
         }
 
         if updated {
-            self.write_updated_content(file_path, new_content)?;
+            self.write_updated_content(file_path, &compose_file.content, new_content)?;
         }
 
         Ok((updated, errors))
     }
 
-    fn write_updated_content(&self, file_path: &str, content: String) -> Result<()> {
+    fn write_updated_content(
+        &self,
+        file_path: &str,
+        original_content: &str,
+        content: String,
+    ) -> Result<()> {
         if self.config.dry_run {
             info!("Dry run: would update {}", file_path);
         } else {
+            // Registry lookups can take minutes. Check the entire snapshot, not
+            // just the image lines, immediately before writing so edits to other
+            // properties and comments are protected as well.
+            let current_content = fs::read_to_string(file_path)
+                .context("Could not re-read Compose file before writing; update skipped")?;
+            ensure!(
+                current_content == original_content,
+                "Compose file changed during registry lookups; update skipped, retry on the next run"
+            );
             fs::write(file_path, content)?;
             info!("Updated compose file: {}", file_path);
         }
@@ -328,6 +342,104 @@ fn choose_new_tag(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::RegistryConfig;
+    use tempfile::TempDir;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn test_edits_during_registry_lookup_are_preserved() {
+        for edit in [
+            Some("services:\n  web:\n    image: test.registry/app:1.0.0\n# User comment\n"),
+            Some("services:\n  web:\n    image: test.registry/app:3.0.0\n"),
+            None,
+        ] {
+            check_update_during_lookup(edit, true).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_unchanged_file_is_updated_after_registry_lookup() {
+        check_update_during_lookup(None, false).await;
+    }
+
+    async fn check_update_during_lookup(edit: Option<&str>, change_file: bool) {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("compose.yaml");
+        fs::write(
+            &path,
+            "services:\n  web:\n    image: test.registry/app:1.0.0\n",
+        )
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server_path = path.clone();
+        let edit = edit.map(str::to_owned);
+        let server_edit = edit.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 1024];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let length = stream.read(&mut buffer).await.unwrap();
+                assert_ne!(length, 0);
+                request.extend_from_slice(&buffer[..length]);
+            }
+            // The updater has parsed the file and is awaiting the registry.
+            // Edit it before replying, without relying on timing or sleeps.
+            if change_file {
+                match server_edit {
+                    Some(content) => fs::write(&server_path, content).unwrap(),
+                    None => fs::remove_file(&server_path).unwrap(),
+                }
+            }
+            let body = r#"{"name":"app","tags":["1.0.0","2.0.0"]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let mut config = Config {
+            compose_paths: vec![path.clone()],
+            update_strategy: UpdateStrategy::Latest,
+            dry_run: false,
+            registry_request_interval_ms: 0,
+            ..Config::default()
+        };
+        config.registries.insert(
+            "test.registry".to_string(),
+            RegistryConfig {
+                url,
+                auth_token: None,
+                username: None,
+            },
+        );
+        let report = ComposeUpdater::new(config)
+            .update_all_compose_files()
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        if change_file {
+            assert!(report.updated_files.is_empty());
+            assert_eq!(report.errors.len(), 1);
+            if let Some(edit) = edit {
+                assert_eq!(fs::read_to_string(path).unwrap(), edit);
+                assert!(report.errors[0].contains("changed"), "{:?}", report.errors);
+            } else {
+                assert!(!path.exists(), "a deleted file must not be recreated");
+            }
+        } else {
+            assert!(report.errors.is_empty(), "{:?}", report.errors);
+            assert_eq!(report.updated_files, vec![path.to_string_lossy()]);
+            assert_eq!(
+                fs::read_to_string(path).unwrap(),
+                "services:\n  web:\n    image: test.registry/app:2.0.0\n"
+            );
+        }
+    }
 
     fn version_infos(tags: &[&str]) -> Vec<VersionInfo> {
         tags.iter()

@@ -68,6 +68,9 @@ impl Scheduler {
     async fn run_update(&self) -> Result<()> {
         let start_time = Instant::now();
         info!("Starting update cycle");
+        if let Some(health) = &self.health_handle {
+            health.report_update_started();
+        }
 
         match self.updater.update_all_compose_files().await {
             Ok(report) => {
@@ -85,7 +88,8 @@ impl Scheduler {
 
                 // A degraded run (some services/files failed) still applied the
                 // updates that succeeded, but the operator must see the failure:
-                // health stays binary and fails closed.
+                // /updates fails closed while /health continues reporting
+                // service availability.
                 if !report.errors.is_empty() {
                     for err in &report.errors {
                         error!("Update error: {}", err);

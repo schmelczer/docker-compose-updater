@@ -1,6 +1,8 @@
 use crate::registry::ImageRef;
-use anyhow::Result;
+use anyhow::{ensure, Context, Result};
 use regex::Regex;
+use serde_yaml::Value;
+use std::collections::HashMap;
 use std::fs;
 use std::sync::LazyLock;
 use tracing::{info, warn};
@@ -8,6 +10,21 @@ use tracing::{info, warn};
 static IMAGE_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"^\s*image:\s*(?:["']([^"']+)["']|([^\s#]+))\s*(#.*)?$"#).unwrap()
 });
+
+// Recognize a block mapping header without discarding quoted keys, anchors,
+// trailing whitespace or comments. Decode the key with YAML rather than treating
+// its quotes or escapes as part of the service name.
+static MAPPING_HEADER_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"^("(?:[^"\\]|\\.)*"|'(?:[^']|'')*'|[^:\s][^:]*?)[ \t]*:[ \t]*(?:&[^\s]+[ \t]*)?(?:#.*)?$"#,
+    )
+    .unwrap()
+});
+
+fn mapping_header_key(line: &str) -> Option<String> {
+    let captures = MAPPING_HEADER_REGEX.captures(line)?;
+    serde_yaml::from_str(captures.get(1)?.as_str().trim_end()).ok()
+}
 
 #[derive(Debug, Clone)]
 pub struct ServiceImage {
@@ -36,6 +53,32 @@ impl ComposeParser {
     }
 
     fn extract_services(&self, content: &str) -> Result<Vec<ServiceImage>> {
+        // YAML supplies the expected services, while the line scan supplies the
+        // source locations needed for edits that preserve formatting. Reconcile
+        // the two so unsupported layouts cannot silently lose services.
+        let mut document: Value = serde_yaml::from_str(content).context("Invalid Compose YAML")?;
+        document
+            .apply_merge()
+            .context("Invalid Compose YAML merge")?;
+        let mut expected_images = HashMap::new();
+        if let Some(declarations) = document.get("services").filter(|value| !value.is_null()) {
+            let declarations = declarations
+                .as_mapping()
+                .context("Compose services must be a mapping")?;
+            for (name, declaration) in declarations {
+                let name = name
+                    .as_str()
+                    .context("Compose service names must be strings")?;
+                if let Some(image) = declaration.get("image").and_then(Value::as_str) {
+                    if !image.trim().is_empty() && !image.contains('@') {
+                        if let Ok(image_ref) = ImageRef::parse(image) {
+                            expected_images.insert(name.to_string(), image_ref.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
         let mut services = Vec::new();
         let lines: Vec<&str> = content.lines().collect();
         let mut in_services = false;
@@ -52,7 +95,7 @@ impl ComposeParser {
 
             let indent = line.len() - trimmed.len();
 
-            if indent == 0 && trimmed.starts_with("services:") {
+            if indent == 0 && mapping_header_key(trimmed).as_deref() == Some("services") {
                 in_services = true;
                 current_service = None;
                 service_indent = None;
@@ -72,20 +115,12 @@ impl ComposeParser {
                 continue;
             }
 
-            if (service_indent.is_none() || indent == service_indent.unwrap())
-                && trimmed.ends_with(':')
-                && !trimmed.contains(' ')
-                && trimmed
-                    .trim_end_matches(':')
-                    .chars()
-                    .all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.')
-            {
-                let name = trimmed.trim_end_matches(':');
-                if !name.is_empty() {
-                    service_indent = Some(indent);
-                    service_child_indent = None;
-                    current_service = Some(name.to_string());
-                }
+            if service_indent.is_none() || service_indent == Some(indent) {
+                service_indent = Some(indent);
+                service_child_indent = None;
+                // Always reset at a service boundary, even if this header is an
+                // unsupported layout, so its image cannot belong to its sibling.
+                current_service = mapping_header_key(trimmed);
                 continue;
             }
 
@@ -115,6 +150,23 @@ impl ComposeParser {
                 }
             }
         }
+
+        for (name, image) in &expected_images {
+            ensure!(
+                services
+                    .iter()
+                    .filter(|service| service.service_name == *name
+                        && service.image_ref.to_string() == *image)
+                    .count()
+                    == 1,
+                "Cannot safely locate image for service '{}'; use a block service mapping with a direct, single-line image property (flow mappings and inherited images are unsupported)",
+                name
+            );
+        }
+        ensure!(
+            services.len() == expected_images.len(),
+            "Image source locations do not match the Compose YAML services"
+        );
 
         Ok(services)
     }
@@ -165,6 +217,53 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn test_yaml_service_declarations() {
+        for header in [
+            "web: # Web server",
+            "web:   ",
+            "\"web\":",
+            "'web': # Quoted name",
+            "web: &web_config",
+            "\"web\": &web_config # Anchored service",
+        ] {
+            let content = format!(
+                "services:\n  first:\n    image: redis:7.0.0\n  {header}\n    build:\n      image: nested:9.9.9\n    image: nginx:1.21.0\n"
+            );
+            let services = ComposeParser::new().extract_services(&content).unwrap();
+
+            assert_eq!(services.len(), 2, "header: {header}");
+            assert_eq!(services[0].service_name, "first");
+            assert_eq!(services[1].service_name, "web", "header: {header}");
+            assert_eq!(services[1].image_ref.to_string(), "nginx:1.21.0");
+            assert_eq!(services[1].line_number, 6);
+            assert_eq!(services[1].original_line, "    image: nginx:1.21.0");
+        }
+    }
+
+    #[test]
+    fn test_quoted_and_anchored_services_mapping() {
+        let content = "'services': &services # Services\n  'web':\n    image: nginx:1.21.0\n";
+        let services = ComposeParser::new().extract_services(content).unwrap();
+        assert_eq!(services.len(), 1);
+        assert_eq!(services[0].service_name, "web");
+    }
+
+    #[test]
+    fn test_unsupported_image_locations_are_reported() {
+        for content in [
+            "services:\n  web: {image: 'nginx:1.21.0'}\n",
+            "services: {web: {image: 'nginx:1.21.0'}}\n",
+            "x-base: &base\n  image: nginx:1.21.0\nservices:\n  web: *base\n",
+            "x-base: &base\n  image: nginx:1.21.0\nservices:\n  web:\n    <<: *base\n",
+        ] {
+            let error = ComposeParser::new()
+                .extract_services(content)
+                .expect_err("an image that cannot be safely located must produce an error");
+            assert!(error.to_string().contains("web"), "{error}");
+        }
+    }
 
     #[test]
     fn test_parse_compose_file() {
