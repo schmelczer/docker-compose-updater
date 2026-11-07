@@ -38,7 +38,7 @@ services:
       - /volumes/life-towers/src/schema.sql:/docker-entrypoint-initdb.d/init.sql
     environment:
       POSTGRES_USER: storebackend
-      POSTGRES_PASSWORD: UKLpn6y4j4AjmBuB
+      POSTGRES_PASSWORD: change-this
       POSTGRES_DB: store
       TZ: $TIME_ZONE
     networks:

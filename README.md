@@ -19,13 +19,20 @@ A robust, production-ready Rust service that automatically updates Docker Compos
 
 ### Using Docker Compose (Recommended)
 
+Clone the repository and run the following steps from its root. The example
+builds the included Dockerfile locally and does not require a published image.
+
+```bash
+git clone https://github.com/schmelczer/docker-compose-updater.git
+cd docker-compose-updater
+mkdir -p compose-files
+```
+
 1. **Create a configuration file** (`config.yaml`):
 ```yaml
 # Paths to scan for Docker Compose files
 compose_paths:
-  - "./compose-files"
-  - "./docker-compose.yml"
-  - "./services"
+  - "/app/compose-files"
 
 # Cron expression for update schedule
 schedule: "0 0 2 * * *"  # Daily at 2 AM UTC
@@ -52,12 +59,12 @@ registries:
     auth_token: "${GITHUB_TOKEN}"
 ```
 
-2. **Deploy with Docker Compose**:
+2. **Save this as `docker-compose.yml`**:
 ```yaml
-version: '3.8'
 services:
   docker-compose-updater:
-    image: ghcr.io/your-username/docker-compose-updater:latest
+    build: .
+    image: docker-compose-updater:local
     container_name: docker-compose-updater
     restart: unless-stopped
     environment:
@@ -75,8 +82,11 @@ services:
 
 3. **Start the service**:
 ```bash
-docker-compose up -d
+docker compose up -d --build
 ```
+
+Place the Compose files you want to update in `compose-files/`. Ensure UID 1000
+can write to them and read `config.yaml`.
 
 ### Command Line Usage
 
@@ -220,15 +230,32 @@ localhost:5000/myapp:latest
 127.0.0.1:8080/service:dev
 ```
 
+Compose services use block mappings with direct, single-line `image:` properties.
+Service headers may include quoted names, comments, trailing whitespace, and
+anchors. Layouts that cannot be safely edited, including flow mappings and images
+inherited through YAML aliases or merges, produce an error instead of being
+silently skipped. If a file changes during registry lookups, the updater leaves
+it untouched and reports a conflict; the next run reads the latest contents.
+
 ## Health Monitoring & Observability
 
 The service provides comprehensive monitoring capabilities:
 
 ### Health Endpoints
-- **`GET /`**: Basic health check
-  - Returns `{"status":"healthy"}` when operational
-  - Returns `{"status":"unhealthy"}` during failures
-  - Includes basic service information
+- **`GET /health`** (also `/`): Service availability, HTTP 200 with
+  `{"status":"healthy"}` while the service is responding, including during
+  registry lookups and after a failed update. Use this for Docker health checks
+  and endpoint availability probes.
+- **`GET /updates`**: The last completed update result, independently of
+  availability. Returns `{"last_update_success":true,"update_in_progress":false}`
+  after success, and HTTP 503 with `last_update_success: false` after any failed
+  or partially failed cycle. A new cycle preserves the previous result until it
+  finishes. Before the first completion, the result is `null` and HTTP 200.
+  Alert on HTTP 503 here as an update failure; logs identify the affected images.
+
+A registry outage can exhaust retries without stopping the scheduler. Keeping
+the job result separate prevents a transient registry failure from making the
+container appear unavailable until the next daily run.
 
 ### Logging
 ```bash
@@ -272,7 +299,7 @@ with an explicit policy limiting permitted requests.
 
 ```bash
 # Clone the repository
-git clone https://github.com/your-username/docker-compose-updater.git
+git clone https://github.com/schmelczer/docker-compose-updater.git
 cd docker-compose-updater
 
 # Build in release mode

@@ -1,6 +1,7 @@
 services:
   docker-compose-updater:
-    image: ghcr.io/your-username/docker-compose-updater:latest
+    build: .
+    image: docker-compose-updater:local
     container_name: docker-compose-updater
     restart: unless-stopped
 
