@@ -1,4 +1,4 @@
-use docker_compose_updater::compose::updater::ComposeUpdater;
+use docker_compose_updater::compose::parser::ComposeFile;
 use docker_compose_updater::config::{Config, RegistryConfig, UpdateStrategy};
 use docker_compose_updater::registry::ImageRef;
 use std::collections::HashMap;
@@ -16,6 +16,14 @@ fn test_image_ref_comprehensive_parsing() {
         ("nginx", "docker.io", None, "nginx", "latest"),
         ("nginx:1.21", "docker.io", None, "nginx", "1.21"),
         ("nginx:latest", "docker.io", None, "nginx", "latest"),
+        (
+            "localhost:5000/app",
+            "localhost:5000",
+            None,
+            "app",
+            "latest",
+        ),
+        ("localhost/app", "localhost", None, "app", "latest"),
         // Docker Hub with namespace
         (
             "library/nginx:1.21",
@@ -152,9 +160,6 @@ fn test_image_ref_comprehensive_parsing() {
 
 #[tokio::test]
 async fn test_compose_file_parsing_edge_cases() {
-    let config = create_test_config();
-    let updater = ComposeUpdater::new(config);
-
     // Test various compose file formats and edge cases
     let test_cases = vec![
         // Standard compose file
@@ -249,18 +254,18 @@ services:
         let mut temp_file = NamedTempFile::new().unwrap();
         temp_file.write_all(compose_content.as_bytes()).unwrap();
 
-        let result = updater.parse_compose_file(temp_file.path().to_str().unwrap());
+        let result = ComposeFile::read(temp_file.path().to_str().unwrap());
         assert!(result.is_ok(), "Failed to parse compose file: {test_name}");
 
         let compose_file = result.unwrap();
         assert_eq!(
-            compose_file.services.len(),
+            compose_file.images().unwrap().len(),
             expected_services,
             "Service count mismatch for: {test_name}"
         );
 
         // Verify that all services have valid image references
-        for service in &compose_file.services {
+        for service in &compose_file.images().unwrap() {
             assert!(
                 !service.service_name.is_empty(),
                 "Service name should not be empty in: {test_name}"
@@ -283,9 +288,6 @@ services:
 
 #[tokio::test]
 async fn test_compose_content_replacement() {
-    let config = create_test_config();
-    let updater = ComposeUpdater::new(config);
-
     let original_content = r#"
 version: '3.8'
 services:
@@ -297,48 +299,17 @@ services:
     image: postgres:13.6
 "#;
 
-    let mut temp_file = NamedTempFile::new().unwrap();
-    temp_file.write_all(original_content.as_bytes()).unwrap();
-
-    let compose_file = updater
-        .parse_compose_file(temp_file.path().to_str().unwrap())
-        .unwrap();
-
-    // Test replacing nginx image
-    let nginx_service = compose_file
-        .services
-        .iter()
-        .find(|s| s.service_name == "web")
-        .unwrap();
-
-    let result =
-        updater.replace_image_in_content(&compose_file.content, nginx_service, "nginx:1.21.0");
-    assert!(result.is_ok(), "Should successfully replace image");
-
-    let new_content = result.unwrap();
-    assert!(
-        new_content.contains("nginx:1.21.0"),
-        "Should contain new image version"
-    );
-    assert!(
-        !new_content.contains("nginx:1.20.0"),
-        "Should not contain old image version"
-    );
-    assert!(
-        new_content.contains("# Current version"),
-        "Should preserve comments"
-    );
-    assert!(
-        new_content.contains("postgres:13.6"),
-        "Should preserve other services unchanged"
-    );
+    let mut file = ComposeFile::parse(original_content).unwrap();
+    file.set_image("web", "nginx:1.21.0").unwrap();
+    let yaml = serde_yaml::to_string(&file.document).unwrap();
+    let updated: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+    assert_eq!(updated["services"]["web"]["image"], "nginx:1.21.0");
+    assert_eq!(updated["services"]["db"]["image"], "postgres:13.6");
+    assert_eq!(updated["services"]["web"]["ports"][0], "80:80");
 }
 
 #[test]
 fn test_compose_service_image_replacement_edge_cases() {
-    let config = create_test_config();
-    let updater = ComposeUpdater::new(config);
-
     // Test cases with tricky image replacement scenarios
     let test_cases = vec![
         // Multiple occurrences of similar image names
@@ -388,39 +359,15 @@ services:
     ];
 
     for (compose_content, service_name, old_image, new_image) in test_cases {
-        let mut temp_file = NamedTempFile::new().unwrap();
-        temp_file.write_all(compose_content.as_bytes()).unwrap();
-
-        let compose_file = updater
-            .parse_compose_file(temp_file.path().to_str().unwrap())
-            .unwrap();
-
-        let target_service = compose_file
-            .services
-            .iter()
-            .find(|s| s.service_name == service_name)
-            .unwrap();
-
-        let result =
-            updater.replace_image_in_content(&compose_file.content, target_service, new_image);
-        assert!(
-            result.is_ok(),
-            "Should replace image for service: {service_name}"
-        );
-
-        let new_content = result.unwrap();
-        assert!(
-            new_content.contains(new_image),
-            "Should contain new image: {new_image}"
-        );
-
-        // Count occurrences to ensure only the right image was replaced
-        let old_count = compose_content.matches(old_image).count();
-        let new_old_count = new_content.matches(old_image).count();
+        let mut file = ComposeFile::parse(compose_content).unwrap();
+        assert_eq!(file.document["services"][service_name]["image"], old_image);
+        let mut expected = file.document.clone();
+        expected["services"][service_name]["image"] = new_image.into();
+        file.set_image(service_name, new_image).unwrap();
+        let yaml = serde_yaml::to_string(&file.document).unwrap();
         assert_eq!(
-            new_old_count,
-            old_count - 1,
-            "Should replace exactly one occurrence for: {service_name}"
+            serde_yaml::from_str::<serde_yaml::Value>(&yaml).unwrap(),
+            expected
         );
     }
 }

@@ -43,23 +43,25 @@ cargo run -- --config ./demo-config.yaml update  # (demo-config.yaml has dry_run
 
 ## Architecture Overview
 
-This is a Rust-based Docker Compose updater service that automatically updates image versions in Docker Compose files while preserving formatting and comments.
+This is a Rust-based Docker Compose updater service that updates image versions by parsing and serializing YAML. Rewritten files lose comments and original formatting.
 
 ### Core Components
 
 - **`main.rs`**: Entry point with CLI argument parsing using clap. Supports `start` (scheduler) and `update` (one-time) commands.
 - **`config.rs`**: Configuration management with support for multiple registries, update strategies, and image ignore patterns. Loads from `config.yaml` or `/app/config/config.yaml`.
-- **`compose.rs`**: Docker Compose file parsing and updating. Uses regex-based YAML parsing to preserve formatting and comments while updating image versions.
+- **`compose/parser.rs`**: Parses YAML with `serde_yaml`, resolves merges, and reads or changes service image values.
+- **`compose/updater.rs`**: Discovers files with `walkdir`, selects newer image tags, and serializes changed YAML documents.
 - **`registry.rs`**: Container registry interaction for fetching available image versions. Supports Docker Hub, GitHub Container Registry, GitLab, and custom registries.
 - **`scheduler.rs`**: Cron-based scheduling system for automatic updates. Runs health checks and reports status.
-- **`health.rs`**: Health monitoring server that exposes HTTP endpoints for service health checks.
+- **`health.rs`**: Axum routes for service availability and the last update result.
 
 ### Key Design Patterns
 
 - **Configuration-driven**: All behavior controlled through `config.yaml` including paths, schedules, registries, and update strategies.
-- **Preserves formatting**: Uses line-by-line regex parsing rather than full YAML parsing to maintain comments and formatting.
+- **YAML values**: Updates parsed image properties and retains other values. Comments and formatting are discarded on writes; aliases and merges are expanded.
 - **Flexible update strategies**: Supports `LatestPatchOfPreviousMinor` (the highest patch of the newest available release line below the latest published line) and `Latest`. Both only apply targets newer than the current version.
 - **Registry abstraction**: Generic registry client that works with multiple container registries.
+- **Image references**: Uses `oci-spec` to parse container image references.
 - **Health monitoring**: Built-in health server for monitoring service status.
 
 ### Update Strategies

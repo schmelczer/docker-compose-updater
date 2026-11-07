@@ -1,4 +1,4 @@
-use docker_compose_updater::compose::updater::ComposeUpdater;
+use docker_compose_updater::compose::{parser::ComposeFile, updater::ComposeUpdater};
 use docker_compose_updater::config::{Config, RegistryConfig, UpdateStrategy};
 use docker_compose_updater::registry::{Client, ImageRef};
 use std::collections::HashMap;
@@ -30,29 +30,26 @@ services:
     let mut temp_file = NamedTempFile::new().unwrap();
     temp_file.write_all(compose_content.as_bytes()).unwrap();
 
-    let updater = ComposeUpdater::new(create_test_config());
-    let result = updater
-        .parse_compose_file(temp_file.path().to_str().unwrap())
-        .unwrap();
+    let result = ComposeFile::read(temp_file.path().to_str().unwrap()).unwrap();
 
-    assert_eq!(result.services.len(), 3);
+    assert_eq!(result.images().unwrap().len(), 3);
 
-    assert_eq!(result.services[0].service_name, "web");
-    assert_eq!(result.services[0].image_ref.name, "nginx");
-    assert_eq!(result.services[0].image_ref.tag, "1.21.0");
-    assert_eq!(result.services[0].image_ref.registry, "docker.io");
+    assert_eq!(result.images().unwrap()[0].service_name, "web");
+    assert_eq!(result.images().unwrap()[0].image_ref.name, "nginx");
+    assert_eq!(result.images().unwrap()[0].image_ref.tag, "1.21.0");
+    assert_eq!(result.images().unwrap()[0].image_ref.registry, "docker.io");
 
-    assert_eq!(result.services[1].service_name, "db");
-    assert_eq!(result.services[1].image_ref.name, "postgres");
-    assert_eq!(result.services[1].image_ref.tag, "13.7");
+    assert_eq!(result.images().unwrap()[1].service_name, "db");
+    assert_eq!(result.images().unwrap()[1].image_ref.name, "postgres");
+    assert_eq!(result.images().unwrap()[1].image_ref.tag, "13.7");
 
-    assert_eq!(result.services[2].service_name, "redis");
-    assert_eq!(result.services[2].image_ref.name, "redis");
-    assert_eq!(result.services[2].image_ref.tag, "6.2.1-alpine");
+    assert_eq!(result.images().unwrap()[2].service_name, "redis");
+    assert_eq!(result.images().unwrap()[2].image_ref.name, "redis");
+    assert_eq!(result.images().unwrap()[2].image_ref.tag, "6.2.1-alpine");
 }
 
 #[tokio::test]
-async fn test_comment_and_formatting_preservation() {
+async fn test_yaml_updates_preserve_other_values() {
     let compose_content = r#"
 version: '3.8'
 services:
@@ -68,36 +65,19 @@ services:
       POSTGRES_DB: myapp
 "#;
 
-    let mut temp_file = NamedTempFile::new().unwrap();
-    temp_file.write_all(compose_content.as_bytes()).unwrap();
+    let mut file = ComposeFile::parse(compose_content).unwrap();
+    let mut expected = file.document.clone();
+    expected["services"]["web"]["image"] = "nginx:1.22.0".into();
+    expected["services"]["db"]["image"] = "postgres:14.0".into();
 
-    let updater = ComposeUpdater::new(create_test_config());
-    let result = updater
-        .parse_compose_file(temp_file.path().to_str().unwrap())
-        .unwrap();
-
-    assert!(result.services[0]
-        .original_line
-        .contains("# This is a comment"));
-    assert!(result.services[1]
-        .original_line
-        .contains("# Database comment"));
-
-    // Replace unquoted image -> stays unquoted, preserves comment
-    let new_content = updater
-        .replace_image_in_content(&result.content, &result.services[0], "nginx:1.20.0")
-        .unwrap();
-
-    assert!(new_content.contains("nginx:1.20.0  # This is a comment"));
-    assert!(!new_content.contains("nginx:1.21.0"));
-
-    // Replace quoted image -> stays quoted, preserves comment
-    let new_content = updater
-        .replace_image_in_content(&new_content, &result.services[1], "postgres:14.0")
-        .unwrap();
-
-    assert!(new_content.contains("\"postgres:14.0\"  # Database comment"));
-    assert!(!new_content.contains("postgres:13.7"));
+    file.set_image("web", "nginx:1.22.0").unwrap();
+    file.set_image("db", "postgres:14.0").unwrap();
+    let yaml = serde_yaml::to_string(&file.document).unwrap();
+    assert!(!yaml.contains('#'));
+    assert_eq!(
+        serde_yaml::from_str::<serde_yaml::Value>(&yaml).unwrap(),
+        expected
+    );
 }
 
 #[tokio::test]
@@ -108,7 +88,7 @@ async fn test_empty_compose_paths() {
     };
     let updater = ComposeUpdater::new(config);
 
-    let result = updater.update_all_compose_files().await.unwrap();
+    let result = updater.update_all_compose_files().await;
     assert_eq!(result.files_found, 0);
     assert!(result.updated_files.is_empty());
 }

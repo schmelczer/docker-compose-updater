@@ -1,11 +1,11 @@
 # Docker Compose Updater
 
-A robust, production-ready Rust service that automatically updates Docker Compose image versions whilst preserving comments, formatting, and maintaining operational stability. The service operates on a configurable schedule and uses intelligent update strategies to ensure safe, conservative updates.
+A Rust service that updates Docker Compose image versions on a configurable schedule, using conservative version selection by default.
 
 ## Key Features
 
 - 🔄 **Intelligent Updates**: Automatically updates Docker Compose files using configurable update strategies
-- 📝 **Format Preservation**: Maintains all comments, whitespace, and YAML formatting perfectly
+- 📝 **YAML Parsing**: Supports block and flow mappings, aliases, and merges using a YAML parser
 - 🎯 **Conservative Strategies**: Defaults to stable, tested versions rather than bleeding edge
 - 🏥 **Health Monitoring**: Built-in health endpoints for monitoring and observability
 - 🔐 **Multi-Registry Support**: Works with Docker Hub, GitHub Container Registry, GitLab, and custom registries
@@ -230,12 +230,14 @@ localhost:5000/myapp:latest
 127.0.0.1:8080/service:dev
 ```
 
-Compose services use block mappings with direct, single-line `image:` properties.
-Service headers may include quoted names, comments, trailing whitespace, and
-anchors. Layouts that cannot be safely edited, including flow mappings and images
-inherited through YAML aliases or merges, produce an error instead of being
-silently skipped. If a file changes during registry lookups, the updater leaves
-it untouched and reports a conflict; the next run reads the latest contents.
+Compose files are parsed as YAML. When an image changes, the entire document is
+serialized back to YAML: comments, quoting, and whitespace are not preserved,
+and aliases and merges are expanded. Other YAML values are retained. Build-only
+services, empty images, and digest-pinned images are skipped. Files with no image
+updates are left untouched, and dry runs never write files.
+
+If a file changes during registry lookups, the updater leaves it untouched and
+reports a conflict; the next run reads the latest contents.
 
 ## Health Monitoring & Observability
 
@@ -444,7 +446,7 @@ This project is licensed under the MIT Licence - see the [LICENSE](LICENSE) file
 - Initial release with comprehensive functionality
 - Multi-registry support (Docker Hub, GHCR, GitLab, custom)
 - Intelligent update strategies with conservative defaults
-- Comment and formatting preservation
+- YAML parsing and serialization
 - Comprehensive error handling (no silent failures)
 - Health monitoring and observability
 - Extensive test coverage (44+ test cases)

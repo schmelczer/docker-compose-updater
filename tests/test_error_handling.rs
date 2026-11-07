@@ -1,4 +1,4 @@
-use docker_compose_updater::compose::updater::ComposeUpdater;
+use docker_compose_updater::compose::{parser::ComposeFile, updater::ComposeUpdater};
 use docker_compose_updater::config::{Config, RegistryConfig, UpdateStrategy};
 use docker_compose_updater::registry::{Client as RegistryClient, ImageRef};
 use docker_compose_updater::scheduler::Scheduler;
@@ -65,55 +65,40 @@ fn test_scheduler_valid_cron_expressions() {
 
 #[test]
 fn test_compose_invalid_file_paths() {
-    let updater = ComposeUpdater::new(create_test_config());
-
-    assert!(updater
-        .parse_compose_file("/nonexistent/path/file.yml")
-        .is_err());
+    assert!(ComposeFile::read("/nonexistent/path/file.yml").is_err());
 
     let temp_dir = TempDir::new().unwrap();
-    assert!(updater
-        .parse_compose_file(temp_dir.path().to_str().unwrap())
-        .is_err());
+    assert!(ComposeFile::read(temp_dir.path().to_str().unwrap()).is_err());
 }
 
 #[test]
 fn test_compose_malformed_yaml() {
-    let updater = ComposeUpdater::new(create_test_config());
-
     // Missing services section -> no services found
     let mut temp_file = NamedTempFile::new().unwrap();
     temp_file.write_all(b"version: '3.8'\n").unwrap();
-    let result = updater
-        .parse_compose_file(temp_file.path().to_str().unwrap())
-        .unwrap();
-    assert!(result.services.is_empty());
+    let result = ComposeFile::read(temp_file.path().to_str().unwrap()).unwrap();
+    assert!(result.images().unwrap().is_empty());
 
     // Empty file -> no services found
     let mut temp_file = NamedTempFile::new().unwrap();
     temp_file.write_all(b"").unwrap();
-    let result = updater
-        .parse_compose_file(temp_file.path().to_str().unwrap())
-        .unwrap();
-    assert!(result.services.is_empty());
+    let result = ComposeFile::read(temp_file.path().to_str().unwrap()).unwrap();
+    assert!(result.images().unwrap().is_empty());
 
     // Valid services section with invalid version field -> still finds services
     let mut temp_file = NamedTempFile::new().unwrap();
     temp_file
         .write_all(b"version: invalid\nservices:\n  web:\n    image: nginx:1.21.0\n")
         .unwrap();
-    let result = updater
-        .parse_compose_file(temp_file.path().to_str().unwrap())
-        .unwrap();
-    assert_eq!(result.services.len(), 1);
+    let result = ComposeFile::read(temp_file.path().to_str().unwrap()).unwrap();
+    assert_eq!(result.images().unwrap().len(), 1);
 }
 
 #[test]
 fn test_image_ref_parsing_edge_cases() {
-    // Empty string parses but produces empty name (no panic)
-    let result = ImageRef::parse("").unwrap();
-    assert_eq!(result.name, "");
-    assert_eq!(result.tag, "latest");
+    for image in ["", "nginx:", "nginx:invalid tag"] {
+        assert!(ImageRef::parse(image).is_err());
+    }
 
     // Missing tag defaults to "latest"
     let result = ImageRef::parse("nginx").unwrap();
@@ -172,10 +157,39 @@ async fn test_compose_update_with_empty_paths() {
     };
     let updater = ComposeUpdater::new(config);
 
-    let result = updater.update_all_compose_files().await.unwrap();
+    let result = updater.update_all_compose_files().await;
     assert_eq!(result.files_found, 0);
     assert!(result.updated_files.is_empty());
     assert!(result.errors.is_empty());
+}
+
+#[tokio::test]
+async fn scans_nested_files_and_continues_after_path_and_yaml_errors() {
+    let directory = TempDir::new().unwrap();
+    let nested = directory.path().join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    let valid = nested.join("stack.yaml");
+    let content =
+        "# No update: retain the original file\nservices: {app: {image: 'example:latest'}}\n";
+    std::fs::write(&valid, content).unwrap();
+    std::fs::write(
+        directory.path().join("broken.yml"),
+        "services: [invalid yaml",
+    )
+    .unwrap();
+    std::fs::write(directory.path().join("ignored.txt"), "not YAML [").unwrap();
+    let config = Config {
+        compose_paths: vec![
+            directory.path().join("missing"),
+            directory.path().to_path_buf(),
+        ],
+        ..create_test_config()
+    };
+    let report = ComposeUpdater::new(config).update_all_compose_files().await;
+    assert_eq!(report.files_found, 2);
+    assert_eq!(report.errors.len(), 2);
+    assert!(report.updated_files.is_empty());
+    assert_eq!(std::fs::read_to_string(valid).unwrap(), content);
 }
 
 #[tokio::test]
@@ -206,7 +220,7 @@ async fn test_update_continues_after_service_failure() {
     };
 
     let updater = ComposeUpdater::new(config);
-    let report = updater.update_all_compose_files().await.unwrap();
+    let report = updater.update_all_compose_files().await;
 
     assert_eq!(report.files_found, 1);
     assert!(report.updated_files.is_empty());
@@ -266,10 +280,10 @@ fn test_config_edge_cases() {
 
 #[test]
 fn test_version_selection_with_mismatched_prefixes_suffixes() {
-    use docker_compose_updater::strategy::create_selector;
+    use docker_compose_updater::strategy::select_target_version;
     use docker_compose_updater::version::VersionInfo;
 
-    let selector = create_selector(&create_test_config().update_strategy);
+    let strategy = create_test_config().update_strategy;
 
     let current_prefix = Some("v".to_string());
     let current_suffix = Some("-alpine".to_string());
@@ -280,7 +294,12 @@ fn test_version_selection_with_mismatched_prefixes_suffixes() {
         VersionInfo::from_tag("release-1.1.5-alpine").unwrap(),
     ];
 
-    let target = selector.select_target_version(&available, current_prefix, current_suffix);
+    let target = select_target_version(
+        &strategy,
+        &available,
+        current_prefix.as_deref(),
+        current_suffix.as_deref(),
+    );
     assert!(
         target.is_none(),
         "No versions match both prefix 'v' and suffix '-alpine'"

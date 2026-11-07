@@ -7,17 +7,20 @@ description = "Automatically update Docker Compose image versions"
 license = "MIT"
 
 [dependencies]
-tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "time", "fs", "net", "io-util"] }
-reqwest = { version = "0.12", features = ["json"] }
+tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }
+reqwest = "0.12"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"
 semver = "1.0"
 anyhow = "1.0"
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+httpdate = "1.0"
+oci-spec = { version = "0.8", default-features = false, features = ["distribution"] }
 regex = "1.10"
 cron = "0.12"
 clap = { version = "4.0", features = ["derive"] }
-urlencoding = "2"
+walkdir = "2.5"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 chrono = "0.4"
@@ -25,6 +28,7 @@ chrono = "0.4"
 [dev-dependencies]
 tempfile = "3.0"
 tokio = { version = "1.0", features = ["test-util"] }
+tower = { version = "0.5", features = ["util"] }
 
 [lib]
 name = "docker_compose_updater"

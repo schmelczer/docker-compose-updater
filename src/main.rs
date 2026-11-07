@@ -4,17 +4,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tracing::{info, Level};
 
-mod compose;
-mod config;
-mod health;
-mod registry;
-mod scheduler;
-mod strategy;
-mod version;
-
-use config::Config;
-use health::HealthServer;
-use scheduler::Scheduler;
+use docker_compose_updater::{config::Config, health::Health, scheduler::Scheduler};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -63,9 +53,9 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Start => {
-            let (health_server, health_handle) = HealthServer::new();
-            let scheduler = Scheduler::new(config.clone(), Some(health_handle))?;
-            tokio::try_join!(health_server.start(), scheduler.start())?;
+            let health = Health::default();
+            let scheduler = Scheduler::new(config, Some(health.clone()))?;
+            tokio::try_join!(health.start(), scheduler.start())?;
         }
         Commands::Update => {
             let scheduler = Scheduler::new(config, None)?;

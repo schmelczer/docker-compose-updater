@@ -1,11 +1,10 @@
 use crate::config::{Config, RegistryConfig, DEFAULT_AUTH_USERNAME};
 use crate::version::VersionInfo;
 use anyhow::{anyhow, Result};
-use chrono::{DateTime, Utc};
-use reqwest::{header::HeaderMap, Client as HttpClient, Response, StatusCode};
+use reqwest::{header::HeaderMap, Client as HttpClient, StatusCode};
 use std::collections::{HashMap, HashSet};
 use std::sync::{LazyLock, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tokio::time::{sleep, sleep_until, Instant};
 use tracing::{debug, warn};
 
@@ -42,45 +41,23 @@ pub struct ImageRef {
 
 impl ImageRef {
     pub fn parse(image: &str) -> Result<Self> {
-        let (image_part, tag) = if let Some(last_delim) = image.rfind(':') {
-            (&image[..last_delim], &image[last_delim + 1..])
+        let reference: oci_spec::distribution::Reference = image.parse()?;
+        let repository = reference.repository();
+        // Keep short Docker Hub references short when writing updates.
+        let repository = if reference.registry() == "docker.io" && !image.contains('/') {
+            repository.strip_prefix("library/").unwrap_or(repository)
         } else {
-            (image, "latest")
+            repository
         };
-
-        let registry_parts: Vec<&str> = image_part.split('/').collect();
-
-        let (registry, namespace, name) = match registry_parts.len() {
-            0 => return Err(anyhow!("Invalid image format: {}", image)),
-            1 => ("docker.io".to_string(), None, registry_parts[0].to_string()),
-            2 => {
-                if registry_parts[0].contains('.') || registry_parts[0].contains(':') {
-                    (
-                        registry_parts[0].to_string(),
-                        None,
-                        registry_parts[1].to_string(),
-                    )
-                } else {
-                    (
-                        "docker.io".to_string(),
-                        Some(registry_parts[0].to_string()),
-                        registry_parts[1].to_string(),
-                    )
-                }
-            }
-            _ => {
-                let registry = registry_parts[0].to_string();
-                let name = registry_parts[registry_parts.len() - 1].to_string();
-                let namespace = Some(registry_parts[1..registry_parts.len() - 1].join("/"));
-                (registry, namespace, name)
-            }
+        let (namespace, name) = match repository.rsplit_once('/') {
+            Some((namespace, name)) => (Some(namespace.to_owned()), name),
+            None => (None, repository),
         };
-
-        Ok(ImageRef {
-            registry,
+        Ok(Self {
+            registry: reference.registry().to_owned(),
             namespace,
-            name,
-            tag: tag.to_string(),
+            name: name.to_owned(),
+            tag: reference.tag().unwrap_or("latest").to_owned(),
         })
     }
 }
@@ -173,31 +150,22 @@ impl Client {
             return Some(Duration::from_secs(seconds));
         }
 
-        if let Ok(date) = DateTime::parse_from_rfc2822(retry_after) {
-            let now = Utc::now();
-            let wait_time = date.signed_duration_since(now);
-            if wait_time.num_seconds() > 0 {
-                return Some(Duration::from_secs(wait_time.num_seconds() as u64));
-            }
-        }
-
-        None
+        httpdate::parse_http_date(retry_after)
+            .ok()?
+            .duration_since(SystemTime::now())
+            .ok()
     }
 
-    async fn fetch_with_retry<F, Fut>(
+    async fn fetch_with_retry(
         &self,
-        request_fn: F,
+        request: reqwest::RequestBuilder,
         operation_name: &str,
-        request_url: &str,
-    ) -> Result<FetchResult>
-    where
-        F: Fn() -> Fut,
-        Fut: std::future::Future<Output = Result<Response, reqwest::Error>>,
-    {
+    ) -> Result<FetchResult> {
+        let request = request.build()?;
         let mut attempt = 0;
         let mut delay = Duration::from_secs(INITIAL_RETRY_DELAY_SECS);
         let mut rate_limit_delay = Duration::from_secs(INITIAL_RATE_LIMIT_DELAY_SECS);
-        let backend = registry_backend(request_url)?;
+        let backend = registry_backend(request.url().as_str())?;
         let operation_name = format!("{operation_name} [{backend}]");
 
         loop {
@@ -207,7 +175,14 @@ impl Client {
             // transient as one dropped while sending the request (`is_request`),
             // and reading it here lets both be retried.
             let fetched = async {
-                let response = request_fn().await?;
+                let response = self
+                    .http_client
+                    .execute(
+                        request
+                            .try_clone()
+                            .expect("registry GET requests are cloneable"),
+                    )
+                    .await?;
                 let status = response.status();
                 let headers = response.headers().clone();
                 let body = response.text().await?;
@@ -335,10 +310,6 @@ impl Client {
     /// paginates by cursor instead of offset, so it has no such ceiling, and its
     /// 1000-tag pages need ~10x fewer requests.
     pub async fn get_available_versions(&self, image_ref: &ImageRef) -> Result<Vec<VersionInfo>> {
-        self.get_registry_v2_versions(image_ref).await
-    }
-
-    async fn get_registry_v2_versions(&self, image_ref: &ImageRef) -> Result<Vec<VersionInfo>> {
         let registry_config = self.get_registry_config(&image_ref.registry)?;
         let repo_path = self.build_repository_path(image_ref);
 
@@ -352,11 +323,7 @@ impl Client {
 
         loop {
             let url = if let Some(next) = next_url.take() {
-                if next.starts_with("http://") || next.starts_with("https://") {
-                    next
-                } else {
-                    format!("{}{next}", registry_config.url)
-                }
+                next
             } else {
                 format!(
                     "{}/v2/{repo_path}/tags/list?n={OCI_PAGE_SIZE}{}",
@@ -371,20 +338,12 @@ impl Client {
 
             debug!("Registry API URL: {}", url);
 
-            let url_clone = url.clone();
-            let bearer_token_clone = bearer_token.clone();
+            let mut request = self.http_client.get(&url);
+            if let Some(token) = &bearer_token {
+                request = request.bearer_auth(token);
+            }
             let fetched = self
-                .fetch_with_retry(
-                    || async {
-                        let mut request_builder = self.http_client.get(&url_clone);
-                        if let Some(token) = &bearer_token_clone {
-                            request_builder = request_builder.bearer_auth(token);
-                        }
-                        request_builder.send().await
-                    },
-                    &format!("Registry v2 tag listing for {image_ref}"),
-                    &url,
-                )
+                .fetch_with_retry(request, &format!("Registry v2 tag listing for {image_ref}"))
                 .await?;
 
             let (new_tags, raw_last_tag, raw_count, link_next) = if fetched.status
@@ -455,11 +414,7 @@ impl Client {
             // another cursor. Legacy registries without Link headers need a
             // last-tag cursor only when the requested page was full.
             if let Some(next) = link_next {
-                let resolved = if next.starts_with("http://") || next.starts_with("https://") {
-                    next
-                } else {
-                    format!("{}{next}", registry_config.url)
-                };
+                let resolved = reqwest::Url::parse(&url)?.join(&next)?.to_string();
                 if resolved == url {
                     break;
                 }
@@ -499,11 +454,11 @@ impl Client {
         let service = extract_auth_param(auth_str, "service")?;
         let scope = extract_auth_param(auth_str, "scope")?;
 
-        let auth_url = format!(
-            "{realm}?service={}&scope={}",
-            urlencoding::encode(&service),
-            urlencoding::encode(&scope),
-        );
+        let mut auth_url = reqwest::Url::parse(&realm)?;
+        auth_url
+            .query_pairs_mut()
+            .extend_pairs([("service", &service), ("scope", &scope)]);
+        let auth_url = auth_url.as_str();
 
         let credentials = registry_config
             .auth_token
@@ -521,10 +476,10 @@ impl Client {
             });
 
         if credentials.is_none() {
-            return self.request_registry_v2_token(&auth_url, None).await;
+            return self.request_registry_v2_token(auth_url, None).await;
         }
 
-        match self.request_registry_v2_token(&auth_url, credentials).await {
+        match self.request_registry_v2_token(auth_url, credentials).await {
             Ok(token) => Ok(token),
             Err(e) => {
                 warn!(
@@ -537,7 +492,7 @@ impl Client {
                     .lock()
                     .expect("credentials_rejected mutex poisoned")
                     .insert(registry.to_string());
-                self.request_registry_v2_token(&auth_url, None).await
+                self.request_registry_v2_token(auth_url, None).await
             }
         }
     }
@@ -566,18 +521,12 @@ impl Client {
             auth_url
         );
 
+        let mut request = self.http_client.get(auth_url);
+        if let Some((username, token)) = &credentials {
+            request = request.basic_auth(username, Some(token));
+        }
         let token_response = self
-            .fetch_with_retry(
-                || async {
-                    let mut request_builder = self.http_client.get(auth_url);
-                    if let Some((username, token)) = &credentials {
-                        request_builder = request_builder.basic_auth(username, Some(token));
-                    }
-                    request_builder.send().await
-                },
-                "Registry auth token request",
-                auth_url,
-            )
+            .fetch_with_retry(request, "Registry auth token request")
             .await?;
 
         if !token_response.status.is_success() {
@@ -883,7 +832,7 @@ mod tests {
         );
         assert_eq!(client.parse_retry_after("0"), Some(Duration::ZERO));
         assert_eq!(client.parse_retry_after("invalid"), None);
-        let date = (Utc::now() + chrono::Duration::seconds(60)).to_rfc2822();
+        let date = httpdate::fmt_http_date(SystemTime::now() + Duration::from_secs(60));
         let delay = client.parse_retry_after(&date).unwrap();
         assert!(delay >= Duration::from_secs(58) && delay <= Duration::from_secs(60));
     }

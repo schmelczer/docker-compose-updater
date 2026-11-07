@@ -83,19 +83,15 @@ impl Config {
         let content = std::fs::read_to_string(config_path)?;
         let expanded_content = Self::expand_env_vars(&content);
         let mut config: Self = serde_yaml::from_str(&expanded_content)?;
-        config.normalize_auth_tokens();
-        config.restore_missing_default_registries();
-        Ok(config)
-    }
-
-    /// A `registries` block in the config file replaces the defaults wholesale
-    /// rather than merging, so one that lists only (say) ghcr.io would leave
-    /// Docker Hub unresolvable. Put the defaults back for any key the file did
-    /// not set; an explicit entry always wins.
-    fn restore_missing_default_registries(&mut self) {
         for (name, registry) in Self::default().registries {
-            self.registries.entry(name).or_insert(registry);
+            config.registries.entry(name).or_insert(registry);
         }
+        for registry in config.registries.values_mut() {
+            if registry.auth_token.as_deref() == Some("") {
+                registry.auth_token = None;
+            }
+        }
+        Ok(config)
     }
 
     pub fn expand_env_vars(content: &str) -> String {
@@ -111,17 +107,6 @@ impl Config {
                 })
             })
             .into_owned()
-    }
-
-    /// Treat a registry `auth_token` that expanded to an empty string (e.g. an
-    /// unset `${TOKEN}`) as no token at all, so we fall back to unauthenticated
-    /// access with a clear error instead of attempting auth with an empty token.
-    fn normalize_auth_tokens(&mut self) {
-        for registry in self.registries.values_mut() {
-            if registry.auth_token.as_deref() == Some("") {
-                registry.auth_token = None;
-            }
-        }
     }
 
     pub fn is_image_ignored(&self, image: &str) -> bool {
